@@ -1,0 +1,4 @@
+gradio==6.5.1
+numpy==2.3.5
+pytest>=8,<10
+ruff>=0.8
