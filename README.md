@@ -1,5 +1,15 @@
 # ALUMINA STUDIO
 
+## Versión de prueba actual: V17 · Diagramación
+
+Aplicación recuperada desde V16 DEMO FIX3, reorganizada en **LAB / TALLER / SABER**.
+Ejecutar `python run.py`. Generar el archivo para Colab con `python scripts/export_colab.py`.
+Validar esta versión con `pytest tests/test_navigation.py -q`.
+Ver [alcance, estructura y pendientes](docs/DIAGRAMACION_V17.md).
+
+El resto de este README describe la migración R3 anterior, incompleta en el repositorio.
+Sus módulos ausentes y pruebas históricas pendientes no se consideran implementados por esta revisión.
+
 Base modular migrada desde **V14E.4 CLEAN R3**. Google Colab queda como superficie de demo; el repositorio pasa a ser la fuente de verdad del desarrollo.
 
 ## Flujo maestro

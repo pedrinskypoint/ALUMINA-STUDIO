@@ -1,9 +1,6 @@
-from .ui.app import build_app, THEME, APP_VERSION
-from .ui.renderers import CSS
+from .studio import APP_VERSION, build_app, launch
 
-def launch(*, share=False, server_name="0.0.0.0"):
-    demo = build_app()
-    return demo.launch(share=share, server_name=server_name, theme=THEME, css=CSS)
+__all__ = ["APP_VERSION", "build_app", "launch"]
 
 if __name__ == "__main__":
-    launch()
+    launch(share=False)
