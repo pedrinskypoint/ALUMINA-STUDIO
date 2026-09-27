@@ -18,7 +18,7 @@ def main():
         parts.append(module.replace("from __future__ import annotations", ""))
     parts.append("".join(line for i, line in enumerate(lines) if i not in omitted))
     source = "\n\n".join(parts).encode("utf-8")
-    output = ROOT / "build" / "ALUMINA_STUDIO_V17_2_NAVEGACION.py"
+    output = ROOT / "build" / "ALUMINA_STUDIO_V17_3_RESPUESTA.py"
     compile(source, str(output), "exec")
     output.parent.mkdir(exist_ok=True)
     output.write_bytes(source)
