@@ -65,6 +65,9 @@ class Repository:
         if active:
             return copy.deepcopy(active["state"])
         with closing(self.connect()) as db, db:
+            state = self.read(db)
+            if state:
+                return state
             db.execute("BEGIN IMMEDIATE")
             state = self.read(db)
             if not state:

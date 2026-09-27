@@ -38,12 +38,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import gradio as gr
 from .storage import Repository, Snapshot, ConflictError
+from .workbench import (OXIDES, molecular_mass, scale_recipe, umf_calculation,
+                        shrinkage, absorption, plaster_batch, periodic_html, positive)
 from .media import persist_media, thumbnail_uri, migrate_media, media_path
 from .operations import (stock_move, reverse_stock_move, confirm_consumption,
                          normalized_components, formula_version, mass_variations,
                          transition_firing, cooling_history, number)
 
-APP_VERSION = "17.1 MOTOR · PREVIEW"
+APP_VERSION = "17.2 NAVEGACIÓN · PREVIEW"
 SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------------------
@@ -134,6 +136,11 @@ def bind_repository_callbacks(demo, ui_state):
             args = list(args)
             token = args[_positions[0]] or {}
             try:
+                if not _outputs:
+                    latest = load_state()
+                    for i in _positions:
+                        args[i] = latest
+                    return _fn(*args)
                 with repository().transaction(token.get("revisions", {})) as tx:
                     for i in _positions:
                         args[i] = tx["state"]
@@ -892,7 +899,7 @@ def materials_library_html(state: Dict[str, Any], category: str = "Todos", query
     for _, mid in choices[:100]:
         m = state["materials_library"][mid]
         custom = " · propio" if m.get("custom") else ""
-        rows.append(f"<div class='library-row'><div><b>{esc(m.get('name'))}</b><div class='tiny'>{esc(m.get('category'))}{custom}</div></div><span>›</span></div>")
+        rows.append(f"<details class='material-disclosure'><summary><b>{esc(m.get('name'))}</b> · {esc(m.get('category'))}{custom}</summary>{material_detail_html(state, mid)}</details>")
     return "".join(rows)
 
 
@@ -1403,9 +1410,10 @@ html,body{color-scheme:light!important;background:#f7f8fa!important;color:var(--
 .gradio-container{max-width:1120px!important;margin:auto!important;background:#f7f8fa!important;color:var(--ink)!important;--body-background-fill:#f7f8fa!important;--body-background-fill-dark:#f7f8fa!important;--body-text-color:#18222b!important;--body-text-color-dark:#18222b!important;--body-text-color-subdued:#66737f!important;--body-text-color-subdued-dark:#66737f!important;--block-background-fill:#fff!important;--block-background-fill-dark:#fff!important;--block-label-text-color:#394650!important;--block-label-text-color-dark:#394650!important;--block-title-text-color:#18222b!important;--block-title-text-color-dark:#18222b!important;--input-background-fill:#fff!important;--input-background-fill-dark:#fff!important;--input-border-color:#d9e0e5!important;--input-border-color-dark:#d9e0e5!important;--button-secondary-background-fill:#fff!important;--button-secondary-background-fill-dark:#fff!important;--button-secondary-text-color:#18222b!important;--button-secondary-text-color-dark:#18222b!important;--button-primary-background-fill:#2468d7!important;--button-primary-background-fill-dark:#2468d7!important;--button-primary-text-color:#fff!important;--button-primary-text-color-dark:#fff!important}
 .gradio-container input,.gradio-container textarea,.gradio-container select{color:var(--ink)!important;background:#fff!important}
 .gradio-container button{color:var(--ink)!important;background:#fff!important;border-color:var(--line)!important;opacity:1!important}.gradio-container button.primary,.gradio-container .primary button,.gradio-container button[class*="primary"]{background:var(--accent)!important;color:#fff!important;border-color:var(--accent)!important}
-.app-head{position:sticky;top:0;z-index:80;background:rgba(255,255,255,.98)!important;padding:5px 0;border-bottom:1px solid var(--line);backdrop-filter:blur(10px)}
+.app-head{position:relative;z-index:2;background:rgba(255,255,255,.98)!important;padding:5px 0;border-bottom:1px solid var(--line);backdrop-filter:blur(10px)}
 .brand{font-size:19px;font-weight:800;letter-spacing:.035em;color:var(--ink)!important}.demo-badge{display:inline-block;margin-left:8px;padding:2px 7px;border-radius:999px;background:#eef4ff!important;color:#285fae!important;font-size:10px;vertical-align:middle}.tag{font-size:11px;color:var(--muted)!important}
 .nav-pills label,.subnav label,.card-radio label{border:1px solid var(--line)!important;border-radius:11px!important;padding:10px 12px!important;margin:3px!important;background:#fff!important;color:var(--ink)!important;min-height:44px!important;cursor:pointer!important;opacity:1!important}.nav-pills label span,.subnav label span,.card-radio label span{color:var(--ink)!important;opacity:1!important}.nav-pills input,.subnav input,.card-radio input{display:none!important}.nav-pills label:has(input:checked),.subnav label:has(input:checked),.card-radio label:has(input:checked){border-color:var(--accent)!important;box-shadow:0 0 0 2px rgba(36,104,215,.10)!important;background:var(--accent-soft)!important;color:#174d9a!important;font-weight:700!important}.nav-pills label:has(input:checked) span,.subnav label:has(input:checked) span,.card-radio label:has(input:checked) span{color:#174d9a!important}
+.material-disclosure{border:1px solid var(--line);border-radius:10px;margin:8px 0;background:white}.material-disclosure summary{cursor:pointer;padding:14px;min-height:44px}.material-disclosure[open] summary{color:var(--accent);font-weight:700}.tool-panel{overflow:visible!important}.element-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:8px}.element-card{padding:10px;border:1px solid var(--line);border-radius:10px;background:#fff}.element-card summary{cursor:pointer;min-height:44px}.element-card summary b{font-size:24px}.element-card[open]{grid-column:1/-1}.element-card p{font-size:14px}
 .panel,.hero-card,.match-card,.result-card,.list-card,.agenda-card,.journal-entry{border:1px solid var(--line);background:#fff!important;color:var(--ink)!important;border-radius:14px;padding:14px;margin:8px 0}.panel.compact{padding:10px}.notice{background:var(--soft)!important;color:var(--ink)!important;border:1px solid var(--line);border-radius:10px;padding:10px;margin:8px 0}.notice.danger{border-color:#e8beb9;background:#fff4f3!important;color:#842f29!important}.muted{color:var(--muted)!important;font-size:13px}.tiny{color:var(--muted)!important;font-size:11px}.kicker{font-size:11px;letter-spacing:.12em;color:var(--muted)!important;font-weight:700}.section-title{font-size:13px;font-weight:800;margin:14px 0 6px}.status{display:inline-block;border-radius:999px;background:#eef4ff!important;color:#285fae!important;padding:4px 8px;font-size:12px;margin:4px 0 10px}
 .color-id{display:flex;align-items:center;gap:10px;margin:10px 0}.swatch{width:54px;height:54px;border-radius:11px;border:1px solid var(--line);display:inline-block;flex:0 0 auto}.swatch.small{width:30px;height:30px;border-radius:7px}.swatch.result{width:52px;height:52px}.rowline{display:flex;gap:9px;align-items:center}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.grid2>div{background:var(--soft)!important;color:var(--ink)!important;padding:9px;border-radius:9px}.compact{font-size:13px}
 table{width:100%;border-collapse:collapse;font-size:13px;color:var(--ink)!important}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;color:var(--ink)!important}.metric-row{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0}.metric-row>div{background:var(--soft)!important;color:var(--ink)!important;border-radius:12px;padding:10px;text-align:center}.metric-row b{display:block;font-size:18px}.metric-row span{font-size:10px;color:var(--muted)!important}.hero-text{font-size:19px;font-weight:700}.steps{display:flex;gap:6px;flex-wrap:wrap}.step{font-size:12px;color:var(--muted)!important}.step.done{color:var(--ok)!important}.step.current{color:var(--accent)!important;font-weight:800}
@@ -1476,18 +1484,56 @@ def build_app() -> gr.Blocks:
         with gr.Group(visible=False, elem_classes=["tool-panel"]) as tools_panel:
             with gr.Tabs():
                 with gr.Tab("Calculadoras"):
-                    with gr.Row():
-                        calc_moles = gr.Number(value=1.0, label="Moles")
-                        calc_mm = gr.Number(value=100.0, label="Masa molar g/mol")
-                        calc_g = gr.Number(label="Gramos", interactive=False)
-                    calc_btn = gr.Button("Moles → gramos")
-                    with gr.Row():
-                        dry_len = gr.Number(value=100, label="Medida seca mm")
-                        fired_len = gr.Number(value=90, label="Medida cocida mm")
-                        shrink_out = gr.Number(label="Contracción %", interactive=False)
-                    shrink_btn = gr.Button("Calcular contracción")
+                    gr.Markdown("## Calculadoras del taller\nCada cálculo muestra sus unidades y su alcance. No modifica fórmulas ni consume stock.")
+                    with gr.Accordion("Moles ↔ gramos", open=True):
+                        gr.Markdown("**Gramos = moles × masa molar.** Elegí un óxido para completar su masa molar o ingresá la masa de tu compuesto.")
+                        calc_oxide = gr.Dropdown(OXIDES, value="SiO2", label="Óxido de referencia", interactive=True)
+                        with gr.Row():
+                            calc_moles = gr.Number(value=1.0, label="Cantidad (mol)")
+                            calc_mm = gr.Number(value=molecular_mass("SiO2"), label="Masa molar (g/mol)")
+                            calc_g = gr.Number(label="Resultado (g)", interactive=False)
+                        calc_btn = gr.Button("Moles → gramos")
+                        calc_mass = gr.Number(value=100, label="Masa a convertir (g)")
+                        calc_mol_out = gr.Number(label="Resultado (mol)", interactive=False)
+                        calc_inverse = gr.Button("Gramos → moles")
+                    with gr.Accordion("Seger / UMF", open=False):
+                        gr.Markdown("Ingresá **gramos o partes de óxidos**, una línea por óxido. No ingreses nombres de arcillas o fritas. La masa se divide por la masa molar y luego por la suma de fundentes. [Qué expresa una UMF](https://digitalfire.com/glossary/unity+formula).")
+                        umf_material = gr.Dropdown(material_library_choices(initial), label="Cargar análisis de un material", interactive=True)
+                        umf_text = gr.Textbox(value="CaO 10\nNa2O 5\nAl2O3 15\nSiO2 70", lines=6, label="Análisis de óxidos (misma base de masa)")
+                        umf_btn = gr.Button("Calcular Seger / UMF")
+                        umf_out = gr.HTML()
+                    with gr.Accordion("Contracción lineal", open=False):
+                        gr.Markdown("**(Medida inicial − medida final) / medida inicial × 100.** Medí la misma distancia en ambas etapas. Un resultado negativo indica expansión.")
+                        with gr.Row():
+                            dry_len = gr.Number(value=100, label="Medida inicial (mm)")
+                            fired_len = gr.Number(value=90, label="Medida final (mm)")
+                            shrink_out = gr.Number(label="Contracción (%)", interactive=False)
+                        shrink_btn = gr.Button("Calcular contracción")
+                    with gr.Accordion("Absorción de agua", open=False):
+                        gr.Markdown("**(Peso saturado − peso seco) / peso seco × 100.** Usá una muestra cocida, secada a masa constante y luego saturada según tu protocolo, sin agua superficial al pesar. Registrá el método para comparar ensayos; el cálculo no certifica un producto.")
+                        with gr.Row():
+                            abs_dry = gr.Number(label="Peso seco cocido (g)")
+                            abs_wet = gr.Number(label="Peso saturado sin agua superficial (g)")
+                            abs_out = gr.Number(label="Absorción (%)", interactive=False)
+                        abs_btn = gr.Button("Calcular absorción")
+                    with gr.Accordion("Escalado de recetas", open=False):
+                        gr.Markdown("Una línea por material, con cantidad en partes. Todas las cantidades deben usar la misma base. El total se reparte proporcionalmente al peso final.")
+                        scale_text = gr.Textbox(value="Caolín 30\nSílice 20\nFrita 50", lines=5, label="Receta original")
+                        scale_target = gr.Number(value=1000, label="Peso final deseado (g)")
+                        scale_btn = gr.Button("Escalar receta")
+                        scale_out = gr.HTML()
+                    with gr.Accordion("Moldería · yeso y agua", open=False):
+                        gr.Markdown("Calculá el agua a partir del yeso pesado. **Usá la relación indicada por el fabricante de tu producto.** Como referencia específica, [USG No. 1 Pottery Plaster](https://www.usg.com/content/dam/USG_Marketing_Communications/united_states/product_promotional_materials/finished_assets/usg-no1-pottery-plaster-data-en-IG1366.pdf) indica 70 partes de agua por 100 de yeso; no es una proporción universal.")
+                        plaster_mass = gr.Number(value=1000, label="Yeso (g)")
+                        plaster_ratio = gr.Number(label="Agua por cada 100 g de yeso (g)")
+                        plaster_btn = gr.Button("Calcular mezcla de yeso")
+                        plaster_out = gr.HTML()
+                    with gr.Accordion("Adaptar fórmula por temperatura · pendiente", open=False):
+                        gr.Markdown("La adaptación automática aún no está implementada. Requiere composición real, materiales, temperatura y ensayos. La normalización UMF por sí sola no convierte una receta de alta a baja temperatura. Podés crear una derivada desde LAB → Formulario → Partir de existente.")
                 with gr.Tab("Tabla periódica"):
-                    gr.HTML("<div class='notice'><b>Tabla periódica:</b> la tabla interactiva aún no está implementada en esta base. Las fichas disponibles están en Materiales.</div>")
+                    gr.Markdown("## Elementos · referencia cerámica")
+                    element_search = gr.Textbox(label="Buscar elemento", placeholder="Silicio, Si, 14…")
+                    element_table = gr.HTML(periodic_html())
                 with gr.Tab("Conos"):
                     cone_sel = gr.Dropdown(list(CONE_REFERENCE.keys()), value="06", label="Cono Orton · autoportante")
                     cone_detail = gr.HTML(cone_reference_html("06"))
@@ -1500,7 +1546,7 @@ def build_app() -> gr.Blocks:
                             matlib_new = gr.Button("+", scale=1)
                         matlib_category = gr.Radio(MATERIAL_CATEGORIES, value="Todos", label=None, show_label=False, elem_classes=["subnav"])
                         matlib_list = gr.HTML(materials_library_html(initial))
-                        matlib_sel = gr.Dropdown(choices=material_library_choices(initial), label="Abrir ficha")
+                        matlib_sel = gr.Dropdown(choices=material_library_choices(initial), value=(material_library_choices(initial)[0][1] if material_library_choices(initial) else None), label="Abrir ficha por nombre", interactive=True)
                         matlib_detail = gr.HTML(material_detail_html(initial, (material_library_choices(initial)[0][1] if material_library_choices(initial) else "")))
                         with gr.Accordion("Nuevo material propio", open=False) as matlib_new_panel:
                             with gr.Row():
@@ -1870,17 +1916,38 @@ def build_app() -> gr.Blocks:
         def nav_main(name):
             return [gr.update(visible=name == n) for n in module_names]
         def nav_main_clean(name):
-            return nav_main(name) + [gr.update(value=""), gr.update(value="", visible=False)]
-        module_nav.change(nav_main_clean, module_nav, module_groups + [search_q, search_results])
-        config_btn.click(lambda: [gr.update(value=None)] + nav_main_clean("Parámetros"), outputs=[module_nav] + module_groups + [search_q, search_results])
+            return nav_main(name) + [gr.update(value=""), gr.update(value="", visible=False), False, gr.update(visible=False)]
+        module_nav.input(nav_main_clean, module_nav, module_groups + [search_q, search_results, tools_open, tools_panel], queue=False, show_progress="hidden")
+        config_btn.click(lambda: [gr.update(value=None)] + nav_main_clean("Parámetros"), outputs=[module_nav] + module_groups + [search_q, search_results, tools_open, tools_panel], queue=False, show_progress="hidden")
         saber_nav.change(saber_text, saber_nav, saber_content)
 
         def toggle_tools(is_open: bool):
             new = not bool(is_open)
             return new, gr.update(visible=new)
-        tools_btn.click(toggle_tools, inputs=tools_open, outputs=[tools_open, tools_panel])
-        calc_btn.click(lambda m, mm: float(m or 0) * float(mm or 0), [calc_moles, calc_mm], calc_g)
-        shrink_btn.click(lambda dry, fired: 0 if not dry else (float(dry)-float(fired or 0))/float(dry)*100, [dry_len, fired_len], shrink_out)
+        tools_btn.click(toggle_tools, inputs=tools_open, outputs=[tools_open, tools_panel], queue=False, show_progress="hidden")
+        def checked(fn):
+            @functools.wraps(fn)
+            def calculate(*args):
+                try:
+                    return fn(*args)
+                except ValueError as exc:
+                    raise gr.Error(str(exc)) from exc
+            return calculate
+        calc_oxide.input(molecular_mass, calc_oxide, calc_mm, queue=False)
+        calc_btn.click(checked(lambda m, mm: positive(m,"moles",zero=True)*positive(mm,"masa molar")), [calc_moles,calc_mm],calc_g,queue=False)
+        calc_inverse.click(checked(lambda g,mm: positive(g,"gramos",zero=True)/positive(mm,"masa molar")),[calc_mass,calc_mm],calc_mol_out,queue=False)
+        shrink_btn.click(checked(shrinkage),[dry_len,fired_len],shrink_out,queue=False)
+        abs_btn.click(checked(absorption),[abs_dry,abs_wet],abs_out,queue=False)
+        scale_btn.click(checked(scale_recipe),[scale_text,scale_target],scale_out,queue=False)
+        umf_btn.click(checked(umf_calculation),umf_text,umf_out,queue=False)
+        plaster_btn.click(checked(plaster_batch),[plaster_mass,plaster_ratio],plaster_out,queue=False)
+        element_search.input(periodic_html,element_search,element_table,queue=False,show_progress="hidden")
+        def load_oxide_analysis(mid,st):
+            oxides=st.get("materials_library",{}).get(mid,{}).get("oxides",{})
+            if not oxides:
+                raise ValueError("Ese material no tiene análisis cargado. Ingresá la ficha real del fabricante.")
+            return "\n".join(f"{name} {amount}" for name,amount in oxides.items())
+        umf_material.input(load_oxide_analysis,[umf_material,state],umf_text,queue=False)
         cone_sel.change(cone_reference_html, cone_sel, cone_detail)
 
         def search_cb(st, q):
@@ -1897,8 +1964,8 @@ def build_app() -> gr.Blocks:
             (buy_nav, ["Lista", "Pedidos", "Proveedores"], [buy_list_group, buy_orders_group, buy_suppliers_group]),
         ]
         for control, names, groups in sections:
-            control.change(lambda value, names=names: [gr.update(visible=value == n) for n in names], control, groups)
-        route_outputs = [module_nav] + module_groups + [search_q, search_results]
+            control.input(lambda value, names=names: [gr.update(visible=value == n) for n in names], control, groups, queue=False, show_progress="hidden")
+        route_outputs = [module_nav] + module_groups + [search_q, search_results, tools_open, tools_panel]
         for control, names, groups in sections:
             route_outputs += [control] + groups
         def route(module, lab="Color Sampler", trial="Preparación", workshop="Bitácora", log="Agenda", ops="Horneadas", buy="Lista"):
@@ -1906,23 +1973,24 @@ def build_app() -> gr.Blocks:
             for value, (_, names, groups) in zip([lab, trial, workshop, log, ops, buy], sections):
                 updates += [gr.update(value=value)] + [gr.update(visible=value == n) for n in names]
             return updates
-        shop_badge.click(lambda: route("TALLER", workshop="Operaciones", ops="Compras"), outputs=route_outputs)
-        q_formula.click(lambda: route("LAB"), outputs=route_outputs)
-        q_experiment.click(lambda: route("LAB", lab="Ensayo"), outputs=route_outputs)
-        q_result.click(lambda: route("LAB", lab="Ensayo", trial="Resultado"), outputs=route_outputs)
-        q_stock.click(lambda: route("TALLER", workshop="Estante"), outputs=route_outputs)
-        q_buy.click(lambda: route("TALLER", workshop="Operaciones", ops="Compras"), outputs=route_outputs)
-        q_kiln.click(lambda: route("TALLER", workshop="Operaciones"), outputs=route_outputs)
-        q_piece.click(lambda: route("TALLER", log="Registro"), outputs=route_outputs)
-        q_costs.click(lambda: route("TALLER", workshop="Operaciones", ops="Estadísticas"), outputs=route_outputs)
+        shop_badge.click(lambda: route("TALLER", workshop="Operaciones", ops="Compras"), outputs=route_outputs, queue=False, show_progress="hidden")
+        q_formula.click(lambda: route("LAB"), outputs=route_outputs, queue=False, show_progress="hidden")
+        q_experiment.click(lambda: route("LAB", lab="Ensayo"), outputs=route_outputs, queue=False, show_progress="hidden")
+        q_result.click(lambda: route("LAB", lab="Ensayo", trial="Resultado"), outputs=route_outputs, queue=False, show_progress="hidden")
+        q_stock.click(lambda: route("TALLER", workshop="Estante"), outputs=route_outputs, queue=False, show_progress="hidden")
+        q_buy.click(lambda: route("TALLER", workshop="Operaciones", ops="Compras"), outputs=route_outputs, queue=False, show_progress="hidden")
+        q_kiln.click(lambda: route("TALLER", workshop="Operaciones"), outputs=route_outputs, queue=False, show_progress="hidden")
+        q_piece.click(lambda: route("TALLER", log="Registro"), outputs=route_outputs, queue=False, show_progress="hidden")
+        q_costs.click(lambda: route("TALLER", workshop="Operaciones", ops="Estadísticas"), outputs=route_outputs, queue=False, show_progress="hidden")
 
         # Biblioteca técnica de materiales
         def refresh_material_library(st, category, q):
             choices = material_library_choices(st, category or "Todos", q or "")
-            return materials_library_html(st, category or "Todos", q or ""), gr.update(choices=choices, value=(choices[0][1] if choices else None))
-        matlib_search.change(refresh_material_library, [state, matlib_category, matlib_search], [matlib_list, matlib_sel])
-        matlib_category.change(refresh_material_library, [state, matlib_category, matlib_search], [matlib_list, matlib_sel])
-        matlib_sel.change(lambda mid, st: material_detail_html(st, mid), [matlib_sel, state], matlib_detail)
+            return materials_library_html(st, category or "Todos", q or ""), gr.update(choices=choices, value=(choices[0][1] if choices else None)), material_detail_html(st, choices[0][1] if choices else "")
+        matlib_search.change(refresh_material_library, [state, matlib_category, matlib_search], [matlib_list, matlib_sel, matlib_detail], queue=False, show_progress="hidden")
+        matlib_category.change(refresh_material_library, [state, matlib_category, matlib_search], [matlib_list, matlib_sel, matlib_detail], queue=False, show_progress="hidden")
+        matlib_sel.input(lambda mid, st: material_detail_html(st, mid), [matlib_sel, state], matlib_detail, queue=False, show_progress="hidden")
+        matlib_new.click(lambda: gr.update(open=True), outputs=matlib_new_panel, queue=False)
 
         def parse_oxide_block(text):
             out = {}
@@ -2449,8 +2517,8 @@ def _run_self_test_isolated() -> List[str]:
 FORCE_LIGHT_JS = r"""
 () => {
   const force = () => {
-    document.documentElement.classList.remove('dark');
-    if (document.body) document.body.classList.remove('dark');
+    if (document.documentElement.classList.contains('dark')) document.documentElement.classList.remove('dark');
+    if (document.body && document.body.classList.contains('dark')) document.body.classList.remove('dark');
     document.documentElement.style.colorScheme = 'light';
     if (document.body) document.body.style.colorScheme = 'light';
   };
