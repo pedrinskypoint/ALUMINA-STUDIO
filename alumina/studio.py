@@ -28,14 +28,22 @@ import os
 import re
 import sys
 import threading
+import functools
+import uuid
+import zipfile
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import gradio as gr
+from .storage import Repository, Snapshot, ConflictError
+from .media import persist_media, thumbnail_uri, migrate_media, media_path
+from .operations import (stock_move, reverse_stock_move, confirm_consumption,
+                         normalized_components, formula_version, mass_variations,
+                         transition_firing, cooling_history, number)
 
-APP_VERSION = "17 DIAGRAMACIÓN · PREVIEW"
+APP_VERSION = "17.1 MOTOR · PREVIEW"
 SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------------------
@@ -56,17 +64,7 @@ def esc(value: Any) -> str:
 
 
 def uid(prefix: str, records: Dict[str, Any] | List[Dict[str, Any]]) -> str:
-    if isinstance(records, dict):
-        values = records.keys()
-    else:
-        values = [str(x.get("id", "")) for x in records]
-    max_n = 0
-    rx = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
-    for value in values:
-        m = rx.match(str(value))
-        if m:
-            max_n = max(max_n, int(m.group(1)))
-    return f"{prefix}-{max_n + 1:04d}"
+    return f"{prefix}-{uuid.uuid4().hex}"
 
 
 def normalize_text(s: str) -> str:
@@ -77,46 +75,93 @@ def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def save_state(state: Dict[str, Any]) -> None:
-    # Gradio puede ejecutar callbacks concurrentes. Serializamos la escritura
-    # para evitar que dos acciones pisen el mismo JSON durante el replace.
+_REPOSITORIES = {}
+
+
+def repository():
+    path = str((DATA_DIR / "alumina.sqlite3").resolve())
     with STATE_LOCK:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(STATE_FILE)
+        return _REPOSITORIES.setdefault(path, Repository(path))
 
 
-def load_state() -> Dict[str, Any]:
-    if not STATE_FILE.exists():
-        state = demo_state()
-        save_state(state)
-        return state
-    try:
-        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        if int(state.get("schema_version", 0)) != SCHEMA_VERSION:
-            return migrate_state(state)
-        return state
-    except Exception:
-        # Nunca destruir automáticamente el archivo potencialmente recuperable.
-        return initial_state()
+def migration_seed():
+    if STATE_FILE.exists():
+        # Invalid JSON aborts migration; it must never silently become an empty workshop.
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or "schema_version" not in data:
+            raise ValueError("El archivo anterior no es válido. No se modificó.")
+        base = initial_state()
+        base.update(data)
+        base["schema_version"] = SCHEMA_VERSION
+        return migrate_media(DATA_DIR, base)
+    return demo_state()
 
 
-def migrate_state(state: Dict[str, Any]) -> Dict[str, Any]:
+def save_state(state):
+    repository().save(state)
+
+
+def load_state():
+    return repository().load(migration_seed)
+
+
+def migrate_state(data):
+    state = load_state()
     base = initial_state()
-    for key in base:
-        if key in state:
-            base[key] = state[key]
+    base.update(data)
     base["schema_version"] = SCHEMA_VERSION
-    save_state(base)
-    return base
+    state.clear()
+    state.update(migrate_media(DATA_DIR, base))
+    save_state(state)
+    return state
+
+
+def session_token(state):
+    return {"revisions": state.revisions}
+
+
+def bind_repository_callbacks(demo, ui_state):
+    # Adapt the existing presentation callbacks to transactional commands. The
+    # browser session holds only conflict-detection metadata, never domain data.
+    for block_fn in demo.fns.values():
+        if ui_state not in block_fn.inputs:
+            continue
+        original = block_fn.fn
+        positions = [i for i, component in enumerate(block_fn.inputs) if component is ui_state]
+        output_positions = [i for i, component in enumerate(block_fn.outputs) if component is ui_state]
+        @functools.wraps(original)
+        def execute(*args, _fn=original, _positions=positions, _outputs=output_positions):
+            args = list(args)
+            token = args[_positions[0]] or {}
+            try:
+                with repository().transaction(token.get("revisions", {})) as tx:
+                    for i in _positions:
+                        args[i] = tx["state"]
+                    answer = _fn(*args)
+                    if _outputs:
+                        values = list(answer) if isinstance(answer, (tuple, list)) else [answer]
+                        tx["state"] = values[_outputs[0]]
+                if _outputs:
+                    for i in _outputs:
+                        revisions = dict(token.get("revisions", {}))
+                        if _fn.__name__ == "refresh_all_cb":
+                            revisions = dict(tx["committed"].revisions)
+                        else:
+                            for key, version in tx["committed"].revisions.items():
+                                if version != tx["before"].revisions.get(key):
+                                    revisions[key] = version
+                        values[i] = {"revisions": revisions}
+                    return tuple(values)
+                return answer
+            except (ConflictError, ValueError) as exc:
+                raise gr.Error(str(exc)) from exc
+        block_fn.fn = execute
 
 
 def audit_event(state: Dict[str, Any], event: str, ref_type: str = "", ref_id: str = "", note: str = "") -> None:
     state.setdefault("audit", []).append({
         "at": now_iso(), "event": event, "ref_type": ref_type, "ref_id": ref_id, "note": note
     })
-    state["audit"] = state["audit"][-1000:]
 
 
 def initial_state() -> Dict[str, Any]:
@@ -346,7 +391,10 @@ def demo_state() -> Dict[str, Any]:
 
 
 def reset_demo_state() -> Dict[str, Any]:
-    st = demo_state()
+    st = load_state()
+    export_backup_file(st)
+    st.clear()
+    st.update(demo_state())
     save_state(st)
     return st
 
@@ -558,7 +606,7 @@ def formula_match_results(state: Dict[str, Any], target_hex: str, temp_c: float,
             html_parts.append(
                 f"<div class='match-card'><div class='rowline'><span class='swatch small' style='background:{esc(f.get('target_hex','#888'))}'></span>"
                 f"<b>{esc(f.get('name') or f['id'])}</b></div>"
-                f"<div class='muted'>ΔE {de:.2f} · compatibilidad técnica {tech:.0f}/100 · {esc(f.get('target_temp_c',''))} °C · {esc(f.get('atmosphere',''))}</div>"
+                f"<div class='muted'>ΔE00 {format(de, '.2f') if de is not None else 'no disponible: falta objetivo'} · compatibilidad técnica {tech:.0f}/100 · {esc(f.get('target_temp_c',''))} °C · {esc(f.get('atmosphere',''))}</div>"
                 f"<div class='tiny'>{esc(f['id'])}</div></div>"
             )
 
@@ -577,7 +625,7 @@ def formula_match_results(state: Dict[str, Any], target_hex: str, temp_c: float,
             link_html = f"<a target='_blank' href='{esc(link)}'>Ver referencia ↗</a>" if link else ""
             html_parts.append(
                 f"<div class='match-card'><b>{esc(ref.get('name','Referencia'))}</b> · {esc(ref.get('source',''))}"
-                f"<div class='muted'>ΔE {de:.2f} · {esc(ref.get('relation','COLOR SIMILAR'))}</div>{link_html}</div>"
+                f"<div class='muted'>ΔE00 {format(de, '.2f') if de is not None else 'no disponible: falta objetivo'} · {esc(ref.get('relation','COLOR SIMILAR'))}</div>{link_html}</div>"
             )
     return "".join(html_parts)
 
@@ -683,11 +731,14 @@ def tile_progress_html(t: Optional[Dict[str, Any]]) -> str:
             bits.append(f"<span class='step current'>● {s}</span>")
         else:
             bits.append(f"<span class='step'>○ {s}</span>")
+    photos_html = "".join(f"<figure><img class='thumb' src='{thumbnail_uri(DATA_DIR, item.get('photo_path'))}'><figcaption>{esc(item.get('stage'))}</figcaption></figure>" for item in t.get("process_photos", []) if thumbnail_uri(DATA_DIR, item.get("photo_path")))
+    changes = mass_variations(t)
+    mass_html = "".join(f"<div>{esc(x['from'])} → {esc(x['to'])}: {x['loss_g']:.2f} g · {format(x['loss_percent'], '.2f') if x['loss_percent'] is not None else '—'} % de pérdida de masa</div>" for x in changes)
     firing = f"{int(t.get('firing_completed',0))}/{int(t.get('firing_required',1))}"
     return f"""
     <div class='panel'>
       <div class='kicker'>{esc(t['id'])}</div><h3>{esc(t.get('name','Tesela'))}</h3>
-      <div class='steps'>{' '.join(bits)}</div>
+      <div class='steps'>{' '.join(bits)}</div>{mass_html}{photos_html}
       <div class='notice'>Cocción: {firing} · {esc(t.get('firing_type','Monococción'))}</div>
       <div class='muted'>La tesela sólo se considera terminada cuando completa todas las cocciones requeridas y registra Resultado.</div>
     </div>
@@ -699,13 +750,13 @@ def results_gallery_html(state: Dict[str, Any]) -> str:
         return "<div class='notice'>Todavía no hay resultados registrados.</div>"
     cards = []
     for rid, r in sorted(state["results"].items(), key=lambda kv: kv[1].get("created_at", ""), reverse=True):
-        photo = r.get("photo") or r.get("photo_path")
+        photo = thumbnail_uri(DATA_DIR, r.get("photo_path")) or r.get("photo")
         photo_html = f"<img class='thumb' src='{esc(photo)}'>" if photo and str(photo).startswith("data:") else (
             f"<span class='swatch result' style='background:{esc(r.get('result_hex','#888'))}'></span><span class='tiny'>Sin foto</span>"
         )
         cards.append(f"""
         <div class='result-card'>{photo_html}<div><b>{esc(rid)}</b><br>{esc(r.get('outcome',''))} · {esc(r.get('liking',''))}
-        <div class='muted'>{esc(r.get('result_hex',''))} · ΔE {float(r.get('delta_e',0)):.2f}</div></div></div>
+        <div class='muted'>{esc(r.get('result_hex',''))} · {esc(r.get('delta_e_method', 'ΔE histórico; método no registrado'))} {('—' if r.get('delta_e') is None else format(r['delta_e'], '.2f'))}</div></div></div>
         """)
     return "".join(cards)
 
@@ -782,6 +833,8 @@ def compatible_load_choices(state: Dict[str, Any], target_temp: float, atmospher
 def firing_detail_html(f: Optional[Dict[str, Any]]) -> str:
     if not f:
         return "<div class='notice'>No hay hornada activa seleccionada.</div>"
+    history = cooling_history(load_state(), f)
+    cooling = (f"Historial del mismo horno/programa: {history['min_hours']:.1f}–{history['max_hours']:.1f} h hasta apertura ({history['samples']} registros). Incluye demoras del operador; no garantiza temperatura segura." if history else "Apertura estimada: sin historial comparable suficiente. Registrar lecturas reales; no se aplica una curva universal.")
     logs = "".join(
         f"<li>{esc(x.get('at',''))} · {esc(x.get('temp_c',''))} °C · {esc(x.get('stage',''))}</li>"
         for x in f.get("temp_log", [])[-12:]
@@ -791,8 +844,8 @@ def firing_detail_html(f: Optional[Dict[str, Any]]) -> str:
       <div class='kicker'>{esc(f['id'])}</div><h3>{esc(f.get('program_name','Hornada'))}</h3>
       <div class='status'>{esc(f.get('status',''))}</div>
       <div class='grid2 compact'><div><b>Objetivo</b><br>{esc(f.get('target_temp_c'))} °C</div><div><b>Atmósfera</b><br>{esc(f.get('atmosphere'))}</div>
-      <div><b>Estimado</b><br>{float(f.get('estimated_minutes',0))/60:.1f} h</div><div><b>Carga</b><br>{len(f.get('tile_ids',[]))} elementos</div></div>
-      <div class='section-title'>Registro real de temperatura</div><ul>{logs}</ul>
+      <div><b>Duración estimada del programa (sin enfriamiento)</b><br>{float(f.get('estimated_minutes',0))/60:.1f} h</div><div><b>Carga</b><br>{len(f.get('tile_ids',[]))} elementos</div></div>
+      <div class='notice'>Fin del programa: {esc(f.get('program_finished_at') or 'No registrado')}. La apertura requiere una lectura actual del controlador, por debajo del límite configurado.</div><div class='muted'>{esc(cooling)}</div><div class='section-title'>Registro real de temperatura</div><ul>{logs}</ul>
     </div>
     """
 
@@ -884,19 +937,49 @@ def cone_reference_html(cone: str) -> str:
     """
 
 
-def export_backup_file(state: Dict[str, Any]) -> str:
+def export_backup_file(state):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    out = DATA_DIR / f"ALUMINA_BACKUP_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    out.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+    out = DATA_DIR / f"ALUMINA_BACKUP_{uuid.uuid4().hex}.zip"
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("state.json", json.dumps(dict(state), ensure_ascii=False, allow_nan=False))
+        for media in (DATA_DIR / "media").glob("*"):
+            if media.is_file():
+                archive.write(media, "media/" + media.name)
     return str(out)
 
 
-def import_backup_file(path: str) -> Dict[str, Any]:
+def import_backup_file(path):
     if not path:
-        raise ValueError("Elegí un archivo JSON de ALUMINA.")
-    data = json.loads(Path(path).read_text(encoding='utf-8'))
+        raise ValueError("Elegí una copia JSON o ZIP de ALUMINA.")
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as archive:
+            data = json.loads(archive.read("state.json"))
+            if not isinstance(data, dict) or "schema_version" not in data:
+                raise ValueError("Copia inválida.")
+            mapping = {}
+            for info in archive.infolist():
+                name = info.filename
+                if name == "state.json" or info.is_dir():
+                    continue
+                if not name.startswith("media/") or len(Path(name).parts) != 2 or ".." in Path(name).parts:
+                    raise ValueError("La copia contiene una ruta no permitida.")
+                target = DATA_DIR / "media" / (uuid.uuid4().hex + Path(name).suffix)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(archive.read(info))
+                mapping[name] = target.relative_to(DATA_DIR).as_posix()
+            def relink(obj):
+                if isinstance(obj, dict):
+                    return {k: relink(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [relink(v) for v in obj]
+                return mapping.get(obj, obj) if isinstance(obj, str) else obj
+            data = relink(data)
+    else:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, dict) or "schema_version" not in data:
-        raise ValueError("El archivo no parece una copia de ALUMINA.")
+        raise ValueError("El archivo no parece una copia ALUMINA.")
+    # Preserve a portable pre-import recovery point, including media.
+    export_backup_file(load_state())
     return migrate_state(data)
 
 # ---------------------------------------------------------------------------
@@ -910,6 +993,11 @@ def pending_list_items(state: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def shopping_badge_text(state: Dict[str, Any]) -> str:
     return f"Lista · {len(pending_list_items(state))}"
+
+
+def stock_ledger_html(state):
+    rows = "".join(f"<tr><td>{esc(m.get('id', 'Registro anterior'))}</td><td>{esc(m.get('material_id'))}</td><td>{esc(m.get('delta'))}</td><td>{esc(m.get('type'))}</td><td>{esc(m.get('reference_id'))}</td><td>{esc(m.get('reason', ''))}</td></tr>" for m in reversed(state.get("stock_movements", [])[-100:]))
+    return "<div class='panel'><b>Movimientos recientes</b><table><tr><th>ID</th><th>Material</th><th>Cantidad</th><th>Tipo</th><th>Origen</th><th>Motivo</th></tr>" + rows + "</table>Las recepciones se corrigen desde su pedido; los movimientos originales nunca se borran.</div>"
 
 
 def inventory_html(state: Dict[str, Any]) -> str:
@@ -1178,49 +1266,52 @@ def receipt_table_value(state: Dict[str, Any], oid: str) -> List[List[Any]]:
     return rows
 
 
-def apply_receipt(state: Dict[str, Any], oid: str, table: List[List[Any]]) -> Tuple[Dict[str, Any], str]:
-    o = state["orders"].get(oid)
-    if not o:
-        return state, "Pedido no encontrado."
-    by_line = {str(row[0]): row for row in (table or []) if row}
-    any_received = False
-    all_complete = True
-    for line in o.get("lines", []):
-        row = by_line.get(line["line_id"])
-        if row:
-            new_received = max(0.0, float(row[3] or 0))
-            old_received = float(line.get("received_qty", 0))
-            delta = max(0.0, new_received - old_received)
-            if delta > 0:
-                mid = line.get("material_id")
-                if mid in state["inventory"]:
-                    state["inventory"][mid]["qty"] = float(state["inventory"][mid].get("qty",0)) + delta
-                else:
-                    state["inventory"][mid] = {
-                        "id": mid or uid("MAT", state["inventory"]),
-                        "name": line.get("material_name"), "unit": line.get("package_unit", "g"),
-                        "qty": delta, "min_qty": 0.0, "location": "", "preferred_supplier_id": o.get("supplier_id", ""), "notes": ""
-                    }
-                state["stock_movements"].append({
-                    "at": now_iso(), "material_id": mid, "delta": delta,
-                    "type": "purchase_receipt", "reference_id": oid
-                })
-                any_received = True
-            line["received_qty"] = new_received
-            line["actual_unit_price"] = float(row[4] or 0)
-            state["price_history"].append({
-                "at": now_iso(), "supplier_id": o.get("supplier_id", ""), "product_id": line.get("product_id", ""),
-                "material_id": line.get("material_id", ""), "price": line["actual_unit_price"], "order_id": oid
-            })
-        if float(line.get("received_qty",0)) + 1e-9 < float(line.get("qty_ordered",0)):
-            all_complete = False
-    if all_complete and o.get("lines"):
-        o["status"] = "Recibido"
-    elif any_received or any(float(x.get("received_qty",0)) > 0 for x in o.get("lines", [])):
-        o["status"] = "Parcialmente recibido"
-    audit_event(state, "order_received", "order", oid, o["status"])
-    save_state(state)
-    return state, f"Recepción guardada. Estado: {o['status']}. Stock actualizado sólo con cantidades realmente recibidas."
+def apply_receipt(state, oid, table):
+    state = copy.deepcopy(state)
+    order = state["orders"].get(oid)
+    if not order:
+        raise ValueError("Pedido no encontrado.")
+    rows = {}
+    for row in table or []:
+        if len(row) < 5 or str(row[0]) in rows:
+            raise ValueError("Recepción inválida o línea duplicada.")
+        rows[str(row[0])] = row
+    valid_ids = {line["line_id"] for line in order.get("lines", [])}
+    if set(rows) - valid_ids:
+        raise ValueError("La recepción contiene líneas de otro pedido.")
+    changed = False
+    for line in order.get("lines", []):
+        row = rows.get(line["line_id"])
+        if row is None:
+            continue
+        received = number(row[3], "cantidad recibida acumulada")
+        price = number(row[4], "precio real")
+        previous = float(line.get("received_qty", 0))
+        delta = received - previous
+        mid = line.get("material_id")
+        if not mid or mid not in state["inventory"]:
+            raise ValueError("Vinculá un material de Stock antes de recibir el pedido.")
+        # Both positive and negative corrections are ledger entries. The stock
+        # and receipt are committed together, or neither changes.
+        movement = stock_move(state, mid, delta, "purchase_receipt", oid,
+                              reason="Recepción" if delta > 0 else "Corrección de recepción")
+        if movement:
+            movement["line_id"] = line["line_id"]
+            changed = True
+        if line.get("actual_unit_price") != price:
+            state["price_history"].append({"at": now_iso(), "supplier_id": order.get("supplier_id"),
+                "product_id": line.get("product_id"), "material_id": mid, "price": price, "order_id": oid})
+            changed = True
+        line.update(received_qty=received, actual_unit_price=price)
+    complete = bool(order.get("lines")) and all(float(x.get("received_qty", 0)) >= float(x.get("qty_ordered", 0)) for x in order["lines"])
+    partial = any(float(x.get("received_qty", 0)) > 0 for x in order.get("lines", []))
+    status = "Recibido" if complete else "Parcialmente recibido" if partial else "Confirmado"
+    if changed:
+        order["status"] = status
+        audit_event(state, "order_received", "order", oid, status)
+        save_state(state)
+    return state, "Recepción guardada. Las correcciones quedan registradas en Stock." if changed else "Sin cambios; esta recepción ya está registrada."
+
 
 
 # ---------------------------------------------------------------------------
@@ -1358,7 +1449,7 @@ def build_app() -> gr.Blocks:
     t0_obj = initial["tiles"].get(t0) if t0 else None
 
     with gr.Blocks(title=f"ALUMINA STUDIO {APP_VERSION}") as demo:
-        state = gr.State(initial)
+        state = gr.State(session_token(initial))
         parsed_manual_state = gr.State([])
         tools_open = gr.State(False)
 
@@ -1502,6 +1593,9 @@ def build_app() -> gr.Blocks:
                     with gr.Group(visible=bool(t0_obj and t0_obj.get("stage")=="Resultado")) as tile_result_measure_group:
                         gr.Markdown("### Resultado · medición final")
                         tile_fired_length = gr.Number(value=(t0_obj.get("fired_length") if t0_obj else None), label="Medida cocida mm")
+                        tile_bisque_weight = gr.Number(value=(t0_obj.get("bisque_weight") if t0_obj else None), label="Peso bizcocho g (opcional)")
+                        tile_final_weight = gr.Number(value=(t0_obj.get("final_weight") if t0_obj else None), label="Peso final g (opcional)")
+                    tile_process_photo = gr.Image(sources=["upload", "webcam"], type="filepath", label="Foto de esta etapa (opcional)", height=180)
                     tile_notes = gr.Textbox(value=(t0_obj.get("notes","") if t0_obj else ""), lines=3, label="Observación de esta etapa")
                     save_tile_stage = gr.Button("Guardar etapa", variant="primary")
                     tile_msg = gr.HTML()
@@ -1551,6 +1645,7 @@ def build_app() -> gr.Blocks:
                     existing_formula = gr.Dropdown(choices=fchoices0, value=f0, label="Mis fórmulas")
                     existing_detail = gr.HTML(formula_detail_html(initial["formulas"].get(f0)))
                     duplicate_formula_btn = gr.Button("Duplicar / ajustar")
+                    normalized_version_btn = gr.Button("Crear versión normalizada a 100")
                     duplicate_formula_msg = gr.HTML()
 
         # TALLER: operación física, con una sola copia de cada registro.
@@ -1602,14 +1697,27 @@ def build_app() -> gr.Blocks:
                 stock_view = gr.HTML(inventory_html(initial))
                 with gr.Row():
                     stock_material = gr.Dropdown(choices=mchoices0, value=(mchoices0[0][1] if mchoices0 else None), label="Material")
-                    stock_qty = gr.Number(label="Stock actual")
-                    stock_min = gr.Number(label="Mínimo")
+                    stock_qty = gr.Number(value=initial["inventory"].get(mchoices0[0][1], {}).get("qty") if mchoices0 else None, label="Stock actual")
+                    stock_min = gr.Number(value=initial["inventory"].get(mchoices0[0][1], {}).get("min_qty") if mchoices0 else None, label="Mínimo")
                 with gr.Row():
                     stock_location = gr.Textbox(label="Ubicación")
                     stock_pref_supplier = gr.Dropdown(choices=supplier_choices(initial, include_auto=True), label="Proveedor preferido")
                 save_stock_btn = gr.Button("Guardar material / stock")
                 low_to_list_btn = gr.Button("Sugerir faltantes de stock en Lista")
                 stock_msg = gr.HTML()
+                with gr.Accordion("Confirmar consumo / pesado", open=False):
+                    consume_reference = gr.Textbox(label="ID del ensayo, pieza/proyecto o lote")
+                    consume_qty = gr.Number(label="Cantidad consumida (unidad del material seleccionado)")
+                    consume_estimated = gr.Checkbox(label="La cantidad es una estimación")
+                    consume_accept = gr.Checkbox(label="Acepto explícitamente descontar esta estimación")
+                    consume_id = gr.State(uuid.uuid4().hex)
+                    consume_btn = gr.Button("Confirmar pesado / consumo y descontar")
+                with gr.Accordion("Movimientos y correcciones", open=False):
+                    movement_view = gr.HTML(stock_ledger_html(initial))
+                    movement_id = gr.Textbox(label="ID del movimiento a revertir")
+                    movement_reason = gr.Textbox(label="Motivo de la reversión")
+                    movement_reverse = gr.Button("Revertir movimiento")
+                    movement_refresh = gr.Button("Actualizar movimientos")
             with gr.Group(visible=False) as g_ops:
                 ops_nav = gr.Radio(["Horneadas", "Compras", "Estadísticas"], value="Horneadas", show_label=False, elem_classes=["subnav"])
                 with gr.Group(visible=True) as ops_kiln:
@@ -1720,9 +1828,10 @@ def build_app() -> gr.Blocks:
                     cfg_atmosphere = gr.Dropdown(["Oxidante", "Reductora", "Neutra"], value=initial["settings"].get("default_atmosphere","Oxidante"), label="Atmósfera habitual")
                     cfg_firing_type = gr.Dropdown(["Monococción", "Bicocción"], value=initial["settings"].get("default_firing_type","Bicocción"), label="Cocción habitual")
                     save_config = gr.Button("Guardar configuración")
+                    reset_confirm = gr.Checkbox(label="Confirmo reemplazar el taller por datos DEMO (se guarda una copia antes)")
                     reset_demo_btn = gr.Button("Restaurar datos DEMO")
                     config_msg = gr.HTML()
-                    gr.HTML(f"<div class='tiny'>DEMO · Datos: {esc(str(STATE_FILE))}</div>")
+                    gr.HTML(f"<div class='tiny'>Datos: {esc(str(DATA_DIR / 'alumina.sqlite3'))}</div>")
                 with gr.Tab("Unidades"):
                     units = initial["settings"].get("units", {})
                     unit_temp = gr.Dropdown(["°C", "°F"], value=units.get("temperature","°C"), label="Temperatura")
@@ -1737,7 +1846,8 @@ def build_app() -> gr.Blocks:
                     gr.Markdown("### Copia de seguridad")
                     export_backup = gr.Button("Exportar copia ALUMINA")
                     export_file = gr.File(label="Copia generada", interactive=False)
-                    import_file = gr.File(label="Importar copia ALUMINA", file_types=[".json"], type="filepath")
+                    import_file = gr.File(label="Importar copia ALUMINA", file_types=[".json", ".zip"], type="filepath")
+                    import_confirm = gr.Checkbox(label="Confirmo reemplazar el taller con esta copia")
                     import_backup = gr.Button("Importar y reemplazar datos")
                     backup_msg = gr.HTML()
                 with gr.Tab("Mi horno"):
@@ -1864,23 +1974,43 @@ def build_app() -> gr.Blocks:
 
         match_btn.click(lambda st,h,t,a,b: formula_match_results(st, normalize_hex(h), float(t or 0), a, b), [state,target_hex,f_temp,f_atm,f_body], match_out)
 
-        def refresh_dynamic(st):
-            fchoices = [(f"{fid} · {f.get('name') or 'Sin nombre'}", fid) for fid,f in st["formulas"].items()]
-            mchoices = [(f"{mid} · {m.get('name')}", mid) for mid,m in st["inventory"].items()]
-            pchoices = [(p.get("name",pid),pid) for pid,p in st["projects"].items()]
-            schoices = [(s.get("name",sid),sid) for sid,s in st["series"].items()]
-            supchoices = supplier_choices(st, include_auto=True)
-            return (
-                gr.update(choices=fchoices), gr.update(choices=fchoices), gr.update(choices=fchoices),
-                gr.update(choices=mchoices), gr.update(choices=mchoices), gr.update(choices=mchoices),
-                gr.update(choices=pchoices), gr.update(choices=schoices),
-                gr.update(choices=active_experiment_choices(st)), gr.update(choices=tile_choices(st)), gr.update(choices=tile_choices(st)),
-                gr.update(choices=shopping_choices(st)), gr.update(choices=supplier_choices(st, include_auto=True)), gr.update(choices=supplier_choices(st)),
-                gr.update(choices=supplier_choices(st)), gr.update(choices=supplier_choices(st, include_auto=True)),
-                gr.update(choices=order_choices(st)), gr.update(value=shopping_badge_text(st)),
-                home_html(st), inventory_html(st), shopping_list_html(st), results_gallery_html(st), projects_html(st), agenda_html(st), journal_html(st),
-                gr.update(choices=material_library_choices(st)), materials_library_html(st)
-            )
+        def refresh_dynamic(st, force=False):
+            before = getattr(st, "baseline", {})
+            dirty = {key for key in st if force or before.get(key) != st.get(key)}
+            active = getattr(repository().local, "transaction", None)
+            if active and not force:
+                dirty = {key for key in st if active["before"].get(key) != st.get(key)}
+            def update(dependencies, render):
+                return render() if force or dirty.intersection(dependencies) else gr.skip()
+            def formulas():
+                return gr.update(choices=[(f"{fid} · {f.get('name') or 'Sin nombre'}", fid) for fid,f in st["formulas"].items()])
+            def materials():
+                return gr.update(choices=[(f"{mid} · {m.get('name')}", mid) for mid,m in st["inventory"].items()])
+            def suppliers(auto=True):
+                return gr.update(choices=supplier_choices(st, include_auto=auto))
+            lab = [update({"formulas"}, formulas) for _ in range(3)]
+            stock = [update({"inventory"}, materials) for _ in range(3)]
+            production = [
+                update({"projects"}, lambda: gr.update(choices=[(p.get("name",pid),pid) for pid,p in st["projects"].items()])),
+                update({"series"}, lambda: gr.update(choices=[(p.get("name",pid),pid) for pid,p in st["series"].items()])),
+            ]
+            trials = [update({"experiments"}, lambda: gr.update(choices=active_experiment_choices(st)))] + [update({"tiles"}, lambda: gr.update(choices=tile_choices(st))) for _ in range(2)]
+            purchases = [update({"shopping_list"}, lambda: gr.update(choices=shopping_choices(st))),
+                update({"suppliers"}, suppliers), update({"suppliers"}, lambda: suppliers(False)),
+                update({"suppliers"}, lambda: suppliers(False)), update({"suppliers"}, suppliers),
+                update({"orders"}, lambda: gr.update(choices=order_choices(st))),
+                update({"shopping_list"}, lambda: gr.update(value=shopping_badge_text(st)))]
+            views = [
+                update({"inventory","experiments","firings","shopping_list","agenda"}, lambda: home_html(st)),
+                update({"inventory"}, lambda: inventory_html(st)),
+                update({"shopping_list","orders"}, lambda: shopping_list_html(st)),
+                update({"results"}, lambda: results_gallery_html(st)),
+                update({"projects","lots","series"}, lambda: projects_html(st)),
+                update({"agenda"}, lambda: agenda_html(st)), update({"journal"}, lambda: journal_html(st)),
+                update({"materials_library"}, lambda: gr.update(choices=material_library_choices(st))),
+                update({"materials_library","inventory"}, lambda: materials_library_html(st)),
+            ]
+            return tuple(lab + stock + production + trials + purchases + views)
 
         refresh_outputs = [
             existing_formula, exp_formula_sel, formula_library_sel,
@@ -1894,7 +2024,7 @@ def build_app() -> gr.Blocks:
             matlib_sel, matlib_list
         ]
 
-        def save_digital_cb(st, name, origin, hv, vehicle, base_type, chem, optics, surface, body, temp, atm, pct, pigment, x):
+        def save_digital_cb(st, name, origin, hv, vehicle, base_type, chem, optics, surface, body, temp, atm, pct, pigment, x, image_path):
             st = copy.deepcopy(st)
             fid = formula_id_for_origin(st, origin)
             lab = hex_to_lab(hv)
@@ -1908,11 +2038,11 @@ def build_app() -> gr.Blocks:
                 "target_temp_c": float(temp or 0), "atmosphere": atm,
                 "pigment_pct": float(pct or 0), "pigment_candidate": pigment,
                 "x_se": float(x or 0) if pigment == "Cd-S-Se inclusión" else None,
-                "components": [], "versions": []
+                "components": [], "versions": [], "source_image": persist_media(DATA_DIR, image_path)
             }
             audit_event(st,"formula_created","formula",fid,origin); save_state(st)
             return (st, f"<div class='notice'><b>{esc(name or fid)}</b> guardada. ID técnico: {fid}. El nombre del usuario y el ID permanecen separados.</div>", *refresh_dynamic(st))
-        save_digital.click(save_digital_cb, [state,formula_name,digital_origin,target_hex,f_vehicle,f_base_type,f_chem,f_optics,f_surface,f_body,f_temp,f_atm,f_pct,pigment_sel,xse], [state,digital_msg]+refresh_outputs)
+        save_digital.click(save_digital_cb, [state,formula_name,digital_origin,target_hex,f_vehicle,f_base_type,f_chem,f_optics,f_surface,f_body,f_temp,f_atm,f_pct,pigment_sel,xse,digital_image], [state,digital_msg]+refresh_outputs)
 
         def parse_manual_cb(text):
             comps,total,warns = parse_formula_text(text)
@@ -1923,22 +2053,22 @@ def build_app() -> gr.Blocks:
         parse_btn.click(parse_manual_cb, manual_text, [parsed_manual_state, parse_out, normalize_btn])
 
         def normalize_manual_cb(comps):
-            comps = copy.deepcopy(comps or [])
-            total = sum(float(x.get("amount",0)) for x in comps)
-            if total > 0:
-                for c in comps: c["amount"] = float(c["amount"]) / total * 100
-            rows = "".join(f"{c['name']} {c['amount']:.3f}" for c in comps)
-            return comps, "\n".join(f"{c['name']} {c['amount']:.3f}" for c in comps)
-        normalize_btn.click(normalize_manual_cb, parsed_manual_state, [parsed_manual_state, manual_text])
+            normalized = normalized_components(comps)
+            rows = "".join(f"<tr><td>{esc(c['name'])}</td><td>{c['amount']:.3f} %</td></tr>" for c in normalized)
+            return "<div class='panel'><b>Vista normalizada a 100</b><table>" + rows + "</table>El original y sus cantidades permanecen intactos.</div>"
+        normalize_btn.click(normalize_manual_cb, parsed_manual_state, parse_out)
 
         def save_manual_cb(st, name, text, comps, src_type, src_exact, file_path, photo_path):
             st = copy.deepcopy(st)
+            comps, _, warnings = parse_formula_text(text)
+            if not comps:
+                raise ValueError("Ingresá una fórmula válida; el adjunto se conserva como referencia, no se interpreta automáticamente.")
             origin = "PDF" if file_path and str(file_path).lower().endswith(".pdf") else "Manual"
             fid = formula_id_for_origin(st, origin)
             st["formulas"][fid] = {
                 "id": fid, "name": (name or "").strip(), "origin": origin,
                 "source_type": src_type, "source_exact": src_exact, "evidence_state": "Transcrita · revisión técnica pendiente",
-                "created_at": now_iso(), "original_text": text, "original_file": str(file_path or ""), "original_photo": str(photo_path or ""),
+                "created_at": now_iso(), "original_text": text, "original_file": persist_media(DATA_DIR, file_path, False), "original_photo": persist_media(DATA_DIR, photo_path),
                 "components": copy.deepcopy(comps or []), "target_hex": "", "target_lab": None,
                 "vehicle": "", "base_type": "", "chemistry_family": "", "optics": "", "surface": "", "body": "",
                 "target_temp_c": None, "atmosphere": "", "pigment_pct": None, "versions": []
@@ -1952,9 +2082,17 @@ def build_app() -> gr.Blocks:
 
         def duplicate_formula_cb(st,fid):
             if not fid or fid not in st["formulas"]: return st,"<div class='notice'>Elegí una fórmula.</div>",*refresh_dynamic(st)
-            st=copy.deepcopy(st); src=copy.deepcopy(st["formulas"][fid]); nid=uid("FOR",st["formulas"]); src["id"]=nid; src["origin"]="Derivada"; src["derived_from"]=fid; src["created_at"]=now_iso(); src["name"]=(src.get("name") or fid)+" · copia"; st["formulas"][nid]=src; save_state(st)
+            st=copy.deepcopy(st); nid=formula_version(st, fid); save_state(st)
             return st,f"<div class='notice'>Derivada creada: {nid}</div>",*refresh_dynamic(st)
         duplicate_formula_btn.click(duplicate_formula_cb,[state,existing_formula],[state,duplicate_formula_msg]+refresh_outputs)
+
+        def normalized_version_cb(st,fid):
+            if fid not in st["formulas"]:
+                raise ValueError("Elegí una fórmula.")
+            nid = formula_version(st,fid,normalized_components(st["formulas"][fid].get("components")),"Normalización a 100")
+            save_state(st)
+            return st,f"<div class='notice'>Versión {esc(nid)} creada; el original permanece intacto.</div>",*refresh_dynamic(st)
+        normalized_version_btn.click(normalized_version_cb,[state,existing_formula],[state,duplicate_formula_msg]+refresh_outputs)
 
         # Ensayos
         def create_exp_cb(st,fid,mass,water,notes):
@@ -1962,7 +2100,7 @@ def build_app() -> gr.Blocks:
                 return st,"<div class='notice danger'>Elegí una fórmula.</div>",*refresh_dynamic(st)
             st=copy.deepcopy(st); f=st["formulas"][fid]; eid=uid("ENS",st["experiments"])
             st["experiments"][eid]={"id":eid,"formula_id":fid,"name":f.get("name") or f"Ensayo de {fid}","status":"Preparación","created_at":now_iso(),"base_mass_g":float(mass or 0),"water_ml":float(water or 0) if water is not None else None,"notes":notes,"pigment_pct":f.get("pigment_pct"),"target_temp_c":f.get("target_temp_c"),"atmosphere":f.get("atmosphere"),"body":f.get("body"),"tile_ids":[]}
-            save_state(st); audit_event(st,"experiment_created","experiment",eid,fid)
+            audit_event(st,"experiment_created","experiment",eid,fid); save_state(st)
             return st,f"<div class='notice'>Creado {eid}. Los datos de la fórmula se heredaron.</div>",*refresh_dynamic(st)
         create_exp_btn.click(create_exp_cb,[state,exp_formula_sel,exp_mass,exp_water,exp_notes],[state,exp_msg]+refresh_outputs)
 
@@ -1980,7 +2118,7 @@ def build_app() -> gr.Blocks:
         def create_tile_cb(st,eid):
             if not eid or eid not in st["experiments"]: return st,"<div class='notice'>Seleccioná un ensayo.</div>",*refresh_dynamic(st)
             st=copy.deepcopy(st); e=st["experiments"][eid]; tid=uid("TES",st["tiles"]); f=st["formulas"].get(e.get("formula_id"),{})
-            st["tiles"][tid]={"id":tid,"experiment_id":eid,"formula_id":e.get("formula_id"),"name":f.get("name") or tid,"created_at":now_iso(),"firing_type":"Bicocción","firing_required":2,"firing_completed":0,"stage":"Preparación","target_temp_c":float(e.get("target_temp_c") or 1040),"atmosphere":e.get("atmosphere") or "Oxidante","notes":"","firing_ids":[]}
+            st["tiles"][tid]={"id":tid,"experiment_id":eid,"formula_id":e.get("formula_id"),"name":f.get("name") or tid,"created_at":now_iso(),"firing_type":st["settings"].get("default_firing_type","Bicocción"),"firing_required":2 if st["settings"].get("default_firing_type","Bicocción")=="Bicocción" else 1,"firing_completed":0,"stage":"Preparación","target_temp_c":float(e.get("target_temp_c") or 1040),"atmosphere":e.get("atmosphere") or "Oxidante","notes":"","firing_ids":[]}
             e.setdefault("tile_ids",[]).append(tid); e["status"]="Muestra creada"; save_state(st)
             return st,f"<div class='notice'><b>✓ {tid} creada.</b> El ensayo sale de Activos y queda en Historial. Podés crear otra muestra más adelante desde su ficha.</div>",*refresh_dynamic(st)
         create_tile_btn.click(create_tile_cb,[state,experiment_cards],[state,exp_msg]+refresh_outputs)
@@ -1994,26 +2132,30 @@ def build_app() -> gr.Blocks:
         def tile_select_cb(tid,st):
             t=st["tiles"].get(tid)
             if not t:
-                return tile_progress_html(None),"Bicocción","Preparación",None,None,None,None,"",gr.update(visible=False),gr.update(visible=False)
+                return tile_progress_html(None),"Bicocción","Preparación",None,None,None,None,"",gr.update(visible=False),gr.update(visible=False),None,None
             stage=t.get("stage","Preparación")
-            return tile_progress_html(t),t.get("firing_type","Bicocción"),stage,t.get("wet_weight"),t.get("dry_weight"),t.get("dry_length"),t.get("fired_length"),t.get("notes",""),gr.update(visible=(stage=="Secado")),gr.update(visible=(stage=="Resultado"))
-        tile_cards.change(tile_select_cb,[tile_cards,state],[tile_progress,tile_firing_type,tile_stage,tile_wet_weight,tile_dry_weight,tile_dry_length,tile_fired_length,tile_notes,tile_dry_group,tile_result_measure_group])
+            return tile_progress_html(t),t.get("firing_type","Bicocción"),stage,t.get("wet_weight"),t.get("dry_weight"),t.get("dry_length"),t.get("fired_length"),t.get("notes",""),gr.update(visible=(stage=="Secado")),gr.update(visible=(stage=="Resultado")),t.get("bisque_weight"),t.get("final_weight")
+        tile_cards.change(tile_select_cb,[tile_cards,state],[tile_progress,tile_firing_type,tile_stage,tile_wet_weight,tile_dry_weight,tile_dry_length,tile_fired_length,tile_notes,tile_dry_group,tile_result_measure_group,tile_bisque_weight,tile_final_weight])
 
-        def save_tile_cb(st,tid,ftype,stage,ww,dw,dl,fl,notes):
-            if not tid or tid not in st["tiles"]: return st,"<div class='notice'>Seleccioná una tesela.</div>",*refresh_dynamic(st)
-            st=copy.deepcopy(st); t=st["tiles"][tid]; t.update({"firing_type":ftype,"firing_required":2 if ftype=="Bicocción" else 1,"stage":stage,"wet_weight":ww,"dry_weight":dw,"dry_length":dl,"fired_length":fl,"notes":notes})
-            save_state(st); return st,f"<div class='notice'>Etapa guardada: {esc(stage)}.</div>",*refresh_dynamic(st)
-        save_tile_stage.click(save_tile_cb,[state,tile_cards,tile_firing_type,tile_stage,tile_wet_weight,tile_dry_weight,tile_dry_length,tile_fired_length,tile_notes],[state,tile_msg]+refresh_outputs)
+        def save_tile_cb(st,tid,ftype,stage,ww,dw,dl,fl,notes,bw,fw,photo):
+            if not tid or tid not in st["tiles"]: raise ValueError("Seleccioná una tesela.")
+            st=copy.deepcopy(st); t=st["tiles"][tid]; t.update({"firing_type":ftype,"firing_required":2 if ftype=="Bicocción" else 1,"stage":stage,"wet_weight":ww,"dry_weight":dw,"dry_length":dl,"fired_length":fl,"notes":notes,"bisque_weight":bw,"final_weight":fw})
+            if photo:
+                t.setdefault("process_photos", []).append({"id":uuid.uuid4().hex,"stage":stage,"at":now_iso(),"photo_path":persist_media(DATA_DIR, photo)})
+            t["mass_variations"] = mass_variations(t)
+            save_state(st)
+            return st,f"<div class='notice'>Etapa guardada: {esc(stage)}.</div>",*refresh_dynamic(st),tile_progress_html(t),None
+        save_tile_stage.click(save_tile_cb,[state,tile_cards,tile_firing_type,tile_stage,tile_wet_weight,tile_dry_weight,tile_dry_length,tile_fired_length,tile_notes,tile_bisque_weight,tile_final_weight,tile_process_photo],[state,tile_msg]+refresh_outputs+[tile_progress,tile_process_photo])
 
         # Resultados
         def save_result_cb(st,tid,hv,photo,outcome,liking,action,kind,note):
             if not tid or tid not in st["tiles"]: return st,"<div class='notice'>Elegí una tesela.</div>",*refresh_dynamic(st)
             st=copy.deepcopy(st); t=st["tiles"][tid]; f=st["formulas"].get(t.get("formula_id"),{}); rid=uid("RES",st["results"])
-            target_lab=f.get("target_lab") or list(hex_to_lab(hv)); result_lab=list(hex_to_lab(hv)); de=delta_e76(target_lab,result_lab)
-            st["results"][rid]={"id":rid,"tile_id":tid,"formula_id":t.get("formula_id"),"created_at":now_iso(),"result_hex":normalize_hex(hv),"result_lab":result_lab,"delta_e":de,"photo_path":str(photo or ""),"outcome":outcome,"liking":liking,"action":action,"note_kind":kind,"note":note}
+            target_lab=f.get("target_lab"); result_lab=list(hex_to_lab(hv)); de=delta_e2000(target_lab,result_lab) if target_lab is not None else None
+            st["results"][rid]={"id":rid,"tile_id":tid,"formula_id":t.get("formula_id"),"created_at":now_iso(),"result_hex":normalize_hex(hv),"result_lab":result_lab,"delta_e":de,"delta_e_method":"CIEDE2000","photo_path":persist_media(DATA_DIR, photo),"outcome":outcome,"liking":liking,"action":action,"note_kind":kind,"note":note}
             t["stage"]="Resultado"
             if int(t.get("firing_completed",0))>=int(t.get("firing_required",1)): t["completed"]=True
-            save_state(st); return st,f"<div class='notice'>Resultado {rid} guardado · ΔE {de:.2f}.</div>",*refresh_dynamic(st)
+            save_state(st); return st,f"<div class='notice'>Resultado {rid} guardado · ΔE00 {format(de, '.2f') if de is not None else 'no disponible: falta objetivo'}.</div>",*refresh_dynamic(st)
         save_result_btn.click(save_result_cb,[state,result_tile_sel,result_hex,result_photo,result_outcome,result_liking,result_action,note_kind,result_note],[state,result_msg]+refresh_outputs)
 
         def lab_hist_cb(st):
@@ -2023,6 +2165,20 @@ def build_app() -> gr.Blocks:
         refresh_lab_history.click(lab_hist_cb,state,lab_history_html)
 
         # Estante
+        def consume_cb(st, mid, qty, reference, estimated, accepted, confirmation):
+            confirm_consumption(st, mid, qty, reference, estimated=estimated,
+                                accept_estimate=accepted, confirmation_id=confirmation)
+            save_state(st)
+            return st, "<div class='notice'>Consumo confirmado y registrado.</div>", stock_ledger_html(st), *refresh_dynamic(st)
+        consume_btn.click(consume_cb, [state,stock_material,consume_qty,consume_reference,consume_estimated,consume_accept,consume_id], [state,stock_msg,movement_view]+refresh_outputs)
+        for control in [stock_material,consume_qty,consume_reference,consume_estimated,consume_accept]:
+            control.input(lambda: uuid.uuid4().hex, outputs=consume_id)
+        def reverse_cb(st, mid, reason):
+            reverse_stock_move(st, mid, reason)
+            save_state(st)
+            return st, "<div class='notice'>Reversión registrada; el movimiento original se conserva.</div>", stock_ledger_html(st), *refresh_dynamic(st)
+        movement_reverse.click(reverse_cb,[state,movement_id,movement_reason],[state,stock_msg,movement_view]+refresh_outputs)
+        movement_refresh.click(stock_ledger_html,state,movement_view)
         def stock_select_cb(mid,st):
             m=st["inventory"].get(mid,{})
             return m.get("qty"),m.get("min_qty"),m.get("location",""),m.get("preferred_supplier_id","")
@@ -2030,7 +2186,7 @@ def build_app() -> gr.Blocks:
 
         def save_stock_cb(st,mid,qty,minq,loc,pref):
             if not mid or mid not in st["inventory"]: return st,"<div class='notice'>Elegí un material.</div>",*refresh_dynamic(st)
-            st=copy.deepcopy(st); st["inventory"][mid].update({"qty":float(qty or 0),"min_qty":float(minq or 0),"location":loc,"preferred_supplier_id":pref or ""}); save_state(st)
+            st=copy.deepcopy(st); stock_move(st,mid,number(qty,"stock actual")-st["inventory"][mid]["qty"],"adjustment",mid,reason="Ajuste manual confirmado"); st["inventory"][mid].update({"min_qty":number(minq,"stock mínimo"),"location":loc,"preferred_supplier_id":pref or ""}); save_state(st)
             return st,"<div class='notice'>Stock guardado.</div>",*refresh_dynamic(st)
         save_stock_btn.click(save_stock_cb,[state,stock_material,stock_qty,stock_min,stock_location,stock_pref_supplier],[state,stock_msg]+refresh_outputs)
 
@@ -2094,24 +2250,7 @@ def build_app() -> gr.Blocks:
         def set_firing_status(st,fid,new_status,temp=None):
             if not fid or fid not in st["firings"]: return st,"<div class='notice'>Elegí hornada.</div>",firing_detail_html(None),*refresh_dynamic(st)
             st=copy.deepcopy(st); f=st["firings"][fid]
-            if new_status=="Programa finalizado": f["status"]="Enfriando"; f["program_finished_at"]=now_iso()
-            elif new_status=="Apertura":
-                last_temp=float(temp or (f.get("temp_log",[{}])[-1].get("temp_c") if f.get("temp_log") else 999))
-                limit=float(st["settings"].get("opening_temp_c",50))
-                if last_temp>limit: return st,f"<div class='notice danger'>Apertura bloqueada: {last_temp:g} °C > límite {limit:g} °C.</div>",firing_detail_html(f),*refresh_dynamic(st)
-                f["status"]="Abierto"; f["opened_at"]=now_iso()
-            elif new_status=="Descarga":
-                if not f.get("opened_at"): return st,"<div class='notice danger'>Primero confirmar apertura.</div>",firing_detail_html(f),*refresh_dynamic(st)
-                f["status"]="Descargado"; f["unloaded_at"]=now_iso()
-            elif new_status=="Completar":
-                if not f.get("unloaded_at"): return st,"<div class='notice danger'>Primero confirmar descarga.</div>",firing_detail_html(f),*refresh_dynamic(st)
-                f["status"]="Finalizada"; f["completed_at"]=now_iso()
-                for tid in f.get("tile_ids",[]):
-                    t=st["tiles"].get(tid)
-                    if t:
-                        t["firing_completed"]=min(int(t.get("firing_required",1)),int(t.get("firing_completed",0))+1)
-                        if int(t["firing_completed"])>=int(t.get("firing_required",1)): t["stage"]="Resultado"
-                        else: t["stage"]="Cocción"
+            f = transition_firing(st, fid, new_status, temp)
             save_state(st); return st,f"<div class='notice'>Estado: {esc(f['status'])}.</div>",firing_detail_html(f),*refresh_dynamic(st)
         mark_program_done.click(lambda st,fid:set_firing_status(st,fid,"Programa finalizado"),[state,firing_sel],[state,firing_msg,firing_detail]+refresh_outputs)
         confirm_open.click(lambda st,fid,temp:set_firing_status(st,fid,"Apertura",temp),[state,firing_sel,actual_temp],[state,firing_msg,firing_detail]+refresh_outputs)
@@ -2170,10 +2309,12 @@ def build_app() -> gr.Blocks:
         add_supplier_product_btn.click(add_sp_cb,[state,sp_supplier,sp_material,sp_name,sp_code,sp_url,sp_pack,sp_unit,sp_price,sp_price_status,sp_price_date],[state,supplier_msg,supplier_list_html]+refresh_outputs)
 
         # Config
-        def reset_demo_cb():
+        def reset_demo_cb(st, confirmed):
+            if not confirmed:
+                raise ValueError("Confirmá el reemplazo antes de restaurar la demo.")
             st = reset_demo_state()
             return (st, "<div class='notice'>Datos DEMO restaurados.</div>", *refresh_dynamic(st))
-        reset_demo_btn.click(reset_demo_cb, outputs=[state,config_msg]+refresh_outputs)
+        reset_demo_btn.click(reset_demo_cb, inputs=[state,reset_confirm], outputs=[state,config_msg]+refresh_outputs)
 
         def save_config_cb(st,sid,advanced,open_temp,atm,firing_type):
             st=copy.deepcopy(st); st["settings"]["default_supplier_id"]=sid or ""; st["settings"]["advanced_pigment_synthesis"]=bool(advanced); st["settings"]["opening_temp_c"]=float(open_temp or 50); st["settings"]["default_atmosphere"]=atm or "Oxidante"; st["settings"]["default_firing_type"]=firing_type or "Bicocción"; save_state(st); return st,"<div class='notice'>Configuración guardada.</div>",*refresh_dynamic(st)
@@ -2184,14 +2325,16 @@ def build_app() -> gr.Blocks:
         save_units.click(save_units_cb,[state,unit_temp,unit_raw,unit_clay,unit_piece,unit_vol,unit_len],[state,units_msg])
 
         export_backup.click(lambda st: export_backup_file(st), state, export_file)
-        def import_backup_cb(path):
+        def import_backup_cb(st, path, confirmed):
+            if not confirmed:
+                raise ValueError("Confirmá el reemplazo antes de importar.")
             try:
                 st = import_backup_file(path)
                 return (st, "<div class='notice'>Copia importada correctamente.</div>", *refresh_dynamic(st))
             except Exception as e:
                 st = load_state()
                 return (st, f"<div class='notice danger'>{esc(e)}</div>", *refresh_dynamic(st))
-        import_backup.click(import_backup_cb, import_file, [state,backup_msg]+refresh_outputs)
+        import_backup.click(import_backup_cb, [state, import_file, import_confirm], [state,backup_msg]+refresh_outputs)
 
         def kiln_cfg_select(kid,st):
             k=st["kilns"].get(kid,{})
@@ -2202,9 +2345,47 @@ def build_app() -> gr.Blocks:
             st=copy.deepcopy(st); kid=kid or uid("KILN",st["kilns"]); st["kilns"][kid]={"id":kid,"name":name or kid,"capacity_l":capacity,"power_kw":power,"voltage_v":voltage,"controller":controller,"energy_cost_kwh":energy,"notes":notes,"default":kid==st["settings"].get("default_kiln_id")}; save_state(st); return st,"<div class='notice'>Horno guardado.</div>"
         save_kiln_cfg.click(save_kiln_cb,[state,kiln_sel_cfg,kiln_name_cfg,kiln_capacity_cfg,kiln_power_cfg,kiln_voltage_cfg,kiln_controller_cfg,kiln_energy_cfg,kiln_notes_cfg],[state,kiln_cfg_msg])
 
-        # Inicialización de choices al cargar la app.
-        demo.load(lambda st: refresh_dynamic(st), state, refresh_outputs)
+        # A page reload refreshes editable persisted fields together with its
+        # revision token, so a fresh token can never accompany stale form data.
+        def refresh_all_cb(st, mid, eid, tid, oid, kid):
+            mid = mid if mid in st["inventory"] else next(iter(st["inventory"]), None)
+            eid = eid if eid in st["experiments"] else next(iter(st["experiments"]), None)
+            tid = tid if tid in st["tiles"] else next(iter(st["tiles"]), None)
+            oid = oid if oid in st["orders"] else next(iter(st["orders"]), None)
+            kid = kid if kid in st["kilns"] else next(iter(st["kilns"]), None)
+            updates = list(refresh_dynamic(st, force=True))
+            for index, selected in [(3,mid),(8,eid),(9,tid),(16,oid)]:
+                updates[index]["value"] = selected
+            settings = st["settings"]
+            units = settings.get("units", {})
+            return (st, *updates, *stock_select_cb(mid,st), *exp_select_cb(eid,st),
+                    *tile_select_cb(tid,st), *order_select_cb(oid,st),
+                    gr.update(value=kid), *kiln_cfg_select(kid,st),
+                    settings.get("default_supplier_id", ""), bool(settings.get("advanced_pigment_synthesis",False)),
+                    settings.get("opening_temp_c",50), settings.get("default_atmosphere","Oxidante"), settings.get("default_firing_type","Bicocción"),
+                    units.get("temperature","°C"),units.get("raw_weight","g"),units.get("clay_weight","g"),units.get("piece_weight","g"),units.get("volume","mL"),units.get("length","cm"))
+        startup_outputs = [stock_qty,stock_min,stock_location,stock_pref_supplier,experiment_detail,exp_water,exp_notes,
+                           tile_progress,tile_firing_type,tile_stage,tile_wet_weight,tile_dry_weight,tile_dry_length,tile_fired_length,tile_notes,tile_dry_group,tile_result_measure_group,tile_bisque_weight,tile_final_weight,
+                           order_detail,wa_text,wa_link,receipt_table,kiln_sel_cfg,kiln_name_cfg,kiln_capacity_cfg,kiln_power_cfg,kiln_voltage_cfg,kiln_controller_cfg,kiln_energy_cfg,kiln_notes_cfg,
+                           cfg_default_supplier,cfg_advanced,cfg_open_temp,cfg_atmosphere,cfg_firing_type,unit_temp,unit_raw,unit_clay,unit_piece,unit_vol,unit_len]
+        # These controls already occur in the legacy refresh list; update their
+        # existing slot rather than returning duplicate component IDs.
+        startup_pairs = [(i,c) for i,c in enumerate(startup_outputs) if c not in refresh_outputs]
+        original_refresh_all = refresh_all_cb
+        def refresh_all_cb(*args):
+            result = list(original_refresh_all(*args))
+            offset = 1 + len(refresh_outputs)
+            for i,c in enumerate(startup_outputs):
+                if c in refresh_outputs:
+                    slot = 1 + refresh_outputs.index(c)
+                    existing = result[slot]
+                    result[slot] = {**existing, "value": result[offset+i]} if isinstance(existing,dict) else result[offset+i]
+            return tuple(result[:offset] + [result[offset+i] for i,c in startup_pairs])
+        demo.load(refresh_all_cb,[state,stock_material,experiment_cards,tile_cards,order_sel,kiln_sel_cfg],
+                  [state]+refresh_outputs+[c for i,c in startup_pairs])
         demo.load(lambda st: supplier_cards(st), state, supplier_list_html)
+
+        bind_repository_callbacks(demo, state)
 
     return demo
 
@@ -2215,6 +2396,20 @@ def build_app() -> gr.Blocks:
 
 
 def run_self_test() -> List[str]:
+    import tempfile
+    global DATA_DIR, STATE_FILE
+    previous_dir, previous_file = DATA_DIR, STATE_FILE
+    with tempfile.TemporaryDirectory(prefix="alumina-qa-") as directory:
+        DATA_DIR = Path(directory)
+        STATE_FILE = DATA_DIR / "alumina_v16_demo_state.json"
+        try:
+            return _run_self_test_isolated()
+        finally:
+            _REPOSITORIES.pop(str((DATA_DIR / "alumina.sqlite3").resolve()), None)
+            DATA_DIR, STATE_FILE = previous_dir, previous_file
+
+
+def _run_self_test_isolated() -> List[str]:
     results = []
     st = demo_state()
     assert len(st["formulas"]) >= 3 and len(st["experiments"]) >= 3; results.append("PASS datos DEMO")
@@ -2223,7 +2418,9 @@ def run_self_test() -> List[str]:
     assert delta_e2000(lab, lab) < 1e-9; results.append("PASS CIEDE2000")
     comps,total,w = parse_formula_text("Caolín 30\nSílice 20\nFrita 50"); assert len(comps)==3 and abs(total-100)<1e-6; results.append("PASS parser fórmula")
     # Compra y recepción en estado aislado
-    qa = initial_state()
+    qa = load_state()
+    qa.clear()
+    qa.update(initial_state())
     qa["suppliers"]["SUP-0001"]={"id":"SUP-0001","name":"Proveedor QA","phone":"","shipping_cost":0}
     qa["settings"]["default_supplier_id"]="SUP-0001"
     qa["supplier_products"]["SP-0001"]={"id":"SP-0001","supplier_id":"SUP-0001","material_id":"MAT-0001","material_name":"Caolín","name":"Caolín comercial","code":"C001","package_qty":500,"unit":"g","price":1000,"available":True,"price_status":"Ingresado manualmente","price_date":"2026-09-21","url":""}

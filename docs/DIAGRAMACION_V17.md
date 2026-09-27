@@ -1,5 +1,7 @@
 # Diagramación V17 — versión de prueba
 
+Actualización: la persistencia JSON y el refresco general descritos aquí corresponden a V17. La entrega vigente V17.1 los reemplaza progresivamente; ver [motor V17.1](MOTOR_V17_1.md).
+
 Base recuperada del archivo entregado por Pedro, que declara `16 DEMO FIX3`.
 SHA256 de la base: `3962e6a8db4161d9ee26e6281bb4217aa11855a40d923124b46af6b1ad3f4f3c`.
 Decisiones: conversación «Ajustar nueva estructura», con prioridad para los acuerdos del 26/09/2026.
