@@ -1,0 +1,16 @@
+name: Motor y navegacion V17.4
+on: [push, pull_request]
+jobs:
+  navigation:
+    runs-on: ubuntu-latest
+    env:
+      GRADIO_ANALYTICS_ENABLED: "False"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: pytest tests/test_engine.py tests/test_navigation.py tests/test_workbench.py tests/test_scoped_repository.py tests/test_revision.py -q
+      - run: python scripts/export_colab.py
+      - run: python build/ALUMINA_STUDIO_V17_4_REVISION.py --qa

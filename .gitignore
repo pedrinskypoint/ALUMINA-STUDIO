@@ -8,3 +8,4 @@ venv/
 .DS_Store
 build/*.py
 !build/.gitkeep
+alumina_data/

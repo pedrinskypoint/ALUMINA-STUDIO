@@ -1,50 +1,54 @@
 # ALUMINA STUDIO
 
-Base modular migrada desde **V14E.4 CLEAN R3**. Google Colab queda como superficie de demo; el repositorio pasa a ser la fuente de verdad del desarrollo.
+## V17.4 · Correcciones de la revisión funcional · versión de prueba
 
-## Flujo maestro
+Ver [correcciones y límites V17.4](docs/REVISION_V17_4.md).
 
-Color → Pigmento → ADN / perfil molar → Fórmula → Ensayo → Pesado / Stock → Hornada → Costos → Resultado → Tesela.
+La demo incluye **256 colores digitales sRGB** en SQLite: 240 variantes cromáticas y 16 neutros. En **LAB → Color Sampler → Paleta DEMO**, buscar por nombre, número o HEX y elegir un color actualiza el objetivo. Son referencias digitales, no recetas ni resultados de cocción. Al abrir una base DEMO existente se agregan sólo los registros faltantes, sin reemplazar fórmulas, stock ni colores existentes. La paleta se incluye en las copias de seguridad.
 
-## Estructura
+El refresco universal se reemplazó por salidas específicas de cada acción. Los callbacks leen entidades bajo demanda y confirman las escrituras en SQLite antes de responder. La búsqueda usa FTS5 y filtros SQL; las coincidencias de color usan CIEDE2000. Ver [alcance y validación V17.3](docs/RESPUESTA_V17_3.md).
 
-- `alumina/data/`: tablas y datos de referencia.
-- `alumina/core/`: modelos y cálculos puros.
-- `alumina/services/`: operaciones de dominio y escenarios demo.
-- `alumina/ui/`: Gradio + renderizadores.
-- `tests/`: pruebas automáticas.
-- `scripts/build_unified.py`: genera el `.py` único para Colab.
-- `notebooks/`: Colab de demostración.
+Base recuperada de V16 DEMO FIX3, con navegación **LAB / TALLER / SABER** y una primera migración operativa a SQLite. Esta entrega prioriza persistencia, conflictos entre sesiones, fotos durables, movimientos de stock y etapas de horno antes de ampliar la interfaz.
 
-## Ejecutar local / Codespaces
+Correcciones de esta entrega: [navegación y herramientas](docs/NAVEGACION_V17_2.md).
+
+Ver [garantías y límites](docs/MOTOR_V17_1.md) y [diagramación](docs/DIAGRAMACION_V17.md).
+
+## Ejecutar
+
+En Mac, doble clic en **Iniciar ALUMINA.command** y abrir **http://127.0.0.1:7861**.
+Mantener la ventana abierta; Ctrl+C detiene el servidor. No necesita Colab ni un enlace Gradio público.
+El primer arranque requiere Python 3.11 o superior y acceso a Internet para instalar dependencias si no existe un entorno virtual.
+
+**Actualizar ALUMINA.command** descarga cambios de la rama actual de GitHub sin sobrescribir modificaciones locales. Reiniciar la aplicación después de actualizar. Los cambios de código hechos localmente se publican mediante commit/push o la conexión de GitHub; no se suben automáticamente al guardar un archivo.
+
+SQLite, fotos y copias de seguridad quedan en `alumina_data/`, excluida de GitHub. Esa carpeta se conserva entre reinicios. Los datos de Colab no se transfieren solos: exportar su ZIP e importarlo desde Parámetros si se quieren conservar. GitHub sincroniza el código, no los datos del taller.
 
 ```bash
 pip install -r requirements.txt
 python run.py
 ```
 
-## Tests
+Con `run.py`, la carpeta predeterminada es `alumina_data` dentro del proyecto, independientemente de dónde se invoque. Se puede configurar `ALUMINA_DATA_DIR` antes de ejecutar la app. Sin datos se crea un taller de demostración. El servidor escucha sólo en este equipo; `python run.py --port 7862` permite elegir otro puerto.
+
+## Archivo único para Colab
 
 ```bash
-pytest -q
+python scripts/export_colab.py
 ```
 
-## Generar Python unificado para Colab
+Genera `build/ALUMINA_STUDIO_V17_4_REVISION.py`, con motor e interfaz incluidos. En Colab, instalar `gradio==6.5.1` y `numpy==2.3.5`, subir el archivo y ejecutarlo con `%run ALUMINA_STUDIO_V17_4_REVISION.py`.
+
+La carpeta temporal de Colab desaparece al terminar el entorno. Descargar una copia ZIP desde Parámetros antes de cerrarlo y restaurarla en la siguiente sesión. No ejecutar varias instancias de SQLite sobre una carpeta sincronizada de Drive: la protección de sesiones está probada dentro de una base local compartida, no entre runtimes de Colab.
+
+## Validación actual
 
 ```bash
-python scripts/build_unified.py
+pytest tests/test_engine.py tests/test_navigation.py tests/test_workbench.py tests/test_scoped_repository.py tests/test_revision.py -q
+python scripts/export_colab.py
+python build/ALUMINA_STUDIO_V17_4_REVISION.py --qa
 ```
 
-## Modo Demo
+El modo `--qa` utiliza una carpeta temporal aislada. El workflow específico valida este motor y la navegación con Python 3.11.
 
-En `Configuración → Demo` hay tres escenarios:
-
-1. **Taller demo**: stock + horno, sin ensayos.
-2. **Flujo completo**: un ensayo Planificado, uno Listo para horno y uno Cocido, más historial/costos.
-3. **Hornada lista para cerrar**: hornada en Enfriando con 45 °C registrados, para probar el cierre.
-
-`Borrar demo` devuelve la sesión a estado vacío. Los datos demo no son persistentes.
-
-## Persistencia
-
-R3 mantiene memoria temporal detrás de la frontera de repositorio. SQLite/QR durable se reserva para V15.
+La migración modular R3 histórica sigue incompleta: sus tests requieren módulos ausentes (`alumina.ui`, `services`, `data` y `core.chemistry`). Se conservan esas pruebas y su workflow, pero no representan la validación de la aplicación recuperada.
