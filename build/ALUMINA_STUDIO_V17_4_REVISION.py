@@ -1,5 +1,685 @@
 from __future__ import annotations
 
+
+"""Transactional entity storage. Gradio only retains revision tokens."""
+
+
+import copy
+import json
+import sqlite3
+import threading
+import os
+import re
+from collections.abc import MutableMapping
+from contextlib import contextmanager, closing
+from pathlib import Path
+
+
+class ConflictError(ValueError):
+    pass
+
+
+_MISSING = object()
+
+
+class EntityMap(MutableMapping):
+    """Read only the requested entity; enumeration explicitly reads a collection."""
+    def __init__(self, state, collection):
+        self.state, self.collection = state, collection
+
+    def __getitem__(self, key):
+        return self.state.row(self.collection, str(key))
+
+    def __setitem__(self, key, value):
+        self.state.set_row(self.collection, str(key), value)
+
+    def __delitem__(self, key):
+        self.state.delete_row(self.collection, str(key))
+
+    def __iter__(self):
+        keys = {r[0] for r in self.state.db.execute('SELECT id FROM entities WHERE collection=? AND id NOT IN (?,?)', (self.collection, '@kind', '@value'))}
+        for (collection, key), value in self.state.cache.items():
+            if collection == self.collection and key not in {'@kind', '@value'}:
+                keys.discard(key) if value is _MISSING else keys.add(key)
+        return iter(sorted(keys))
+
+    def __len__(self):
+        return sum(1 for _ in self)
+
+    def items(self):
+        # One query for a requested list, instead of N separate entity lookups.
+        for key, payload, version in self.state.db.execute('SELECT id,payload,revision FROM entities WHERE collection=? AND id NOT IN (?,?)', (self.collection, '@kind', '@value')):
+            self.state.remember(self.collection, key, payload, version)
+        return ((key, self[key]) for key in self)
+
+    def values(self):
+        return (value for _, value in self.items())
+
+
+class EntityState(MutableMapping):
+    """Transaction-local unit of work. Original JSON is retained only for read rows."""
+    def __init__(self, db):
+        self.db, self.cache, self.original, self.revisions = db, {}, {}, {}
+        self.collections = {c: k for c,k in db.execute("SELECT collection,id FROM entities WHERE id IN ('@kind','@value')")}
+
+    def remember(self, collection, key, payload, version):
+        pair = collection, key
+        if pair not in self.cache:
+            self.original[pair] = payload
+            self.cache[pair] = json.loads(payload) if payload is not None else _MISSING
+            if version is not None:
+                self.revisions[json.dumps(list(pair))] = version
+
+    def row(self, collection, key):
+        pair = collection, key
+        if pair not in self.cache:
+            record = self.db.execute('SELECT payload,revision FROM entities WHERE collection=? AND id=?', pair).fetchone()
+            self.remember(collection, key, *(record or (None, None)))
+        value = self.cache[pair]
+        if value is _MISSING:
+            raise KeyError(key)
+        return value
+
+    def set_row(self, collection, key, value):
+        try:
+            self.row(collection, key)
+        except KeyError:
+            pass
+        self.cache[collection, key] = value
+
+    def delete_row(self, collection, key):
+        self.row(collection, key)
+        self.cache[collection, key] = _MISSING
+
+    def __getitem__(self, collection):
+        kind = self.collections[collection]
+        return EntityMap(self, collection) if kind == '@kind' else self.row(collection, '@value')
+
+    def __setitem__(self, collection, value):
+        if collection in self.collections:
+            del self[collection]
+        if isinstance(value, (dict, EntityMap)):
+            self.collections[collection] = '@kind'
+            self.set_row(collection, '@kind', 'dict')
+            for key, item in value.items():
+                self.set_row(collection, str(key), item)
+        else:
+            self.collections[collection] = '@value'
+            self.set_row(collection, '@value', value)
+
+    def __delitem__(self, collection):
+        kind = self.collections[collection]
+        if kind == '@kind':
+            for key in list(self[collection]):
+                self.delete_row(collection, key)
+        self.delete_row(collection, kind)
+        del self.collections[collection]
+
+    def __iter__(self):
+        return iter(self.collections)
+
+    def __len__(self):
+        return len(self.collections)
+
+    def materialize(self):
+        return {key: dict(value.items()) if isinstance(value, EntityMap) else value for key,value in self.items()}
+
+    def flush(self, expected):
+        changed = {}
+        for pair, value in self.cache.items():
+            old = self.original[pair]
+            new = None if value is _MISSING else json.dumps(value, ensure_ascii=False, allow_nan=False)
+            if new == old:
+                continue
+            prior = json.loads(old) if old is not None else None
+            if old is not None and value is not _MISSING and value == prior:
+                continue
+            token = json.dumps(list(pair))
+            append = isinstance(prior, list) and isinstance(value, list) and value[:len(prior)] == prior
+            if not append and expected.get(token) != self.revisions.get(token):
+                raise ConflictError('Otro usuario modificó este registro. Recargá la ficha antes de guardar; tus cambios no se sobrescribieron.')
+            changed[pair] = new
+        if not changed:
+            return {}
+        revision = self.db.execute("SELECT value FROM meta WHERE key='revision'").fetchone()[0]+1
+        for pair, payload in changed.items():
+            if payload is None:
+                self.db.execute('DELETE FROM entities WHERE collection=? AND id=?', pair)
+            else:
+                self.db.execute('INSERT INTO entities VALUES (?,?,?,?) ON CONFLICT(collection,id) DO UPDATE SET payload=excluded.payload,revision=excluded.revision', (*pair,payload,revision))
+        self.db.execute("UPDATE meta SET value=? WHERE key='revision'", (revision,))
+        return {json.dumps(list(pair)): revision if payload is not None else None for pair,payload in changed.items()}
+
+
+class Snapshot(dict):
+    def __init__(self, data, revisions=None):
+        super().__init__(data)
+        self.revisions = revisions or {}
+        self.baseline = copy.deepcopy(data)
+
+
+def entity_rows(data):
+    rows = {}
+    for collection, value in data.items():
+        if isinstance(value, dict):
+            rows[(collection, "@kind")] = "dict"
+            for key, item in value.items():
+                rows[(collection, str(key))] = item
+        else:
+            rows[(collection, "@value")] = value
+    return rows
+
+
+class Repository:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.local = threading.local()
+        self.ready = False
+        self.setup_lock = threading.Lock()
+
+    def connect(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(self.path, timeout=30)
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute('PRAGMA synchronous=FULL')
+        with self.setup_lock:
+            if not self.ready:
+                # WAL is opt-in for local disks, never assumed safe on mounted Drive.
+                if os.getenv('ALUMINA_SQLITE_WAL') == '1':
+                    db.execute('PRAGMA journal_mode=WAL')
+                db.execute("CREATE TABLE IF NOT EXISTS entities (collection TEXT, id TEXT, payload TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(collection,id))")
+                db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
+                db.execute("INSERT OR IGNORE INTO meta VALUES ('revision',0)")
+                self.prepare_search(db)
+                db.commit()
+                self.ready = True
+        return db
+
+    def prepare_search(self, db):
+        db.execute("CREATE INDEX IF NOT EXISTS entity_kinds ON entities(id,collection) WHERE id IN ('@kind','@value')")
+        db.execute("CREATE INDEX IF NOT EXISTS formula_filter ON entities(collection,json_extract(payload,'$.vehicle'),json_extract(payload,'$.atmosphere'),json_extract(payload,'$.target_temp_c'))")
+        db.execute("CREATE INDEX IF NOT EXISTS formula_profile ON entities(collection,json_extract(payload,'$.profile'))")
+        created = not db.execute("SELECT 1 FROM sqlite_master WHERE name='entity_search'").fetchone()
+        db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS entity_search USING fts5(collection UNINDEXED, entity_id, name, notes, tokenize='unicode61 remove_diacritics 2')")
+        allowed = "('formulas','experiments','tiles','inventory','orders','projects')"
+        projection = "new.rowid,new.collection,new.id,coalesce(json_extract(new.payload,'$.name'),json_extract(new.payload,'$.material_name'),json_extract(new.payload,'$.supplier_name'),''),coalesce(json_extract(new.payload,'$.notes'),'')"
+        db.execute(f"CREATE TRIGGER IF NOT EXISTS entity_search_insert AFTER INSERT ON entities WHEN new.collection IN {allowed} AND new.id NOT IN ('@kind','@value') BEGIN INSERT INTO entity_search(rowid,collection,entity_id,name,notes) SELECT {projection}; END")
+        db.execute(f"CREATE TRIGGER IF NOT EXISTS entity_search_update AFTER UPDATE ON entities WHEN new.collection IN {allowed} AND new.id NOT IN ('@kind','@value') BEGIN DELETE FROM entity_search WHERE rowid=old.rowid; INSERT INTO entity_search(rowid,collection,entity_id,name,notes) SELECT {projection}; END")
+        db.execute("CREATE TRIGGER IF NOT EXISTS entity_search_delete AFTER DELETE ON entities BEGIN DELETE FROM entity_search WHERE rowid=old.rowid; END")
+        if created:
+            db.execute(f"INSERT INTO entity_search(rowid,collection,entity_id,name,notes) SELECT rowid,collection,id,coalesce(json_extract(payload,'$.name'),json_extract(payload,'$.material_name'),json_extract(payload,'$.supplier_name'),''),coalesce(json_extract(payload,'$.notes'),'') FROM entities WHERE collection IN {allowed} AND id NOT IN ('@kind','@value')")
+
+    def search(self, query, limit=30):
+        tokens = re.findall(r'[^\W_]+', query, flags=re.UNICODE)
+        if not tokens:
+            return []
+        expression = ' AND '.join('"'+word+'"*' for word in tokens)
+        with closing(self.connect()) as db:
+            return db.execute('SELECT collection,entity_id,name FROM entity_search WHERE entity_search MATCH ? ORDER BY rank LIMIT ?', (expression,limit)).fetchall()
+
+    def formula_candidates(self, temperature=None, atmosphere='', body='', vehicle='', profile='', tolerance=50):
+        clauses = ["collection='formulas'", "id NOT IN ('@kind','@value')", "json_type(payload,'$.target_lab')='array'"]
+        params = []
+        for field, value in [('vehicle',vehicle),('atmosphere',atmosphere),('body',body),('profile',profile)]:
+            if value:
+                clauses.append(f"json_extract(payload,'$.{field}')=? COLLATE NOCASE")
+                params.append(value.strip())
+        if temperature:
+            clauses.append("json_extract(payload,'$.target_temp_c') BETWEEN ? AND ?")
+            params.extend([float(temperature)-tolerance,float(temperature)+tolerance])
+        with closing(self.connect()) as db:
+            return [json.loads(row[0]) for row in db.execute('SELECT payload FROM entities WHERE '+' AND '.join(clauses),params)]
+
+    @contextmanager
+    def view(self):
+        with closing(self.connect()) as db, db:
+            db.execute('BEGIN')
+            state = EntityState(db)
+            previous = getattr(self.local, 'read_view', None)
+            self.local.read_view = state
+            try:
+                yield state
+            finally:
+                self.local.read_view = previous
+
+    def read(self, db):
+        data, revisions = {}, {}
+        for collection, key, payload, version in db.execute("SELECT collection,id,payload,revision FROM entities ORDER BY collection,id"):
+            value = json.loads(payload)
+            revisions[json.dumps([collection, key])] = version
+            if key == "@kind":
+                data.setdefault(collection, {})
+            elif key == "@value":
+                data[collection] = value
+            else:
+                data.setdefault(collection, {})[key] = value
+        return Snapshot(data, revisions)
+
+    def load(self, seed):
+        active = getattr(self.local, "transaction", None)
+        if active:
+            return active["state"]
+        read_view = getattr(self.local, 'read_view', None)
+        if read_view is not None:
+            return read_view
+        with closing(self.connect()) as db, db:
+            state = self.read(db)
+            if state:
+                return state
+            db.execute("BEGIN IMMEDIATE")
+            state = self.read(db)
+            if not state:
+                self.write(db, seed(), state, {})
+                state = self.read(db)
+            return state
+
+    def write(self, db, state, current, expected):
+        before, after = entity_rows(current), entity_rows(state)
+        changed = [key for key in before.keys() | after.keys() if before.get(key) != after.get(key) or (key in before) != (key in after)]
+        for key in changed:
+            token = json.dumps(list(key))
+            before_value, after_value = before.get(key), after.get(key)
+            append_only = isinstance(before_value, list) and isinstance(after_value, list) and after_value[:len(before_value)] == before_value
+            if not append_only and expected.get(token) != current.revisions.get(token):
+                raise ConflictError("Otro usuario modificó este registro. Recargá la ficha antes de guardar; tus cambios no se sobrescribieron.")
+        if not changed:
+            return
+        revision = db.execute("SELECT value FROM meta WHERE key='revision'").fetchone()[0] + 1
+        for collection, key in changed:
+            if (collection, key) not in after:
+                db.execute("DELETE FROM entities WHERE collection=? AND id=?", (collection, key))
+            else:
+                db.execute("INSERT INTO entities VALUES (?,?,?,?) ON CONFLICT(collection,id) DO UPDATE SET payload=excluded.payload,revision=excluded.revision", (collection, key, json.dumps(after[(collection, key)], ensure_ascii=False, allow_nan=False), revision))
+        db.execute("UPDATE meta SET value=? WHERE key='revision'", (revision,))
+
+    def save(self, state):
+        active = getattr(self.local, "transaction", None)
+        if active:
+            active["state"] = state
+            return
+        if not isinstance(state, Snapshot):
+            raise ConflictError("La escritura requiere una lectura vigente de la base de datos.")
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            current = self.read(db)
+            # Three-way merge: independent entities survive stale snapshots.
+            merged = copy.deepcopy(current)
+            old, new = entity_rows(state.baseline), entity_rows(state)
+            for collection, key in old.keys() | new.keys():
+                if old.get((collection, key)) == new.get((collection, key)) and ((collection,key) in old) == ((collection,key) in new):
+                    continue
+                if key == "@kind":
+                    merged.setdefault(collection, {})
+                elif key == "@value":
+                    if collection in state:
+                        prior, proposed = state.baseline.get(collection), state[collection]
+                        if isinstance(prior, list) and isinstance(proposed, list) and proposed[:len(prior)] == prior:
+                            merged[collection] = copy.deepcopy(current.get(collection, [])) + copy.deepcopy(proposed[len(prior):])
+                        else:
+                            merged[collection] = copy.deepcopy(proposed)
+                    else:
+                        merged.pop(collection, None)
+                elif key in state.get(collection, {}):
+                    merged.setdefault(collection, {})[key] = copy.deepcopy(state[collection][key])
+                else:
+                    merged.get(collection, {}).pop(key, None)
+            self.write(db, merged, current, state.revisions)
+            fresh = self.read(db)
+            state.clear()
+            state.update(fresh)
+            state.revisions = fresh.revisions
+            state.baseline = copy.deepcopy(dict(fresh))
+
+    @contextmanager
+    def transaction(self, expected):
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            active = {"state": EntityState(db)}
+            self.local.transaction = active
+            try:
+                yield active
+                active['changed_revisions'] = active['state'].flush(expected)
+                active['revisions'] = {json.dumps([c,k]): rev for c,k,rev in db.execute('SELECT collection,id,revision FROM entities')} if active.get('reload') else None
+            finally:
+                self.local.transaction = None
+
+
+"""Durable media references and portable backups, independent of Gradio cache."""
+
+
+import base64
+import io
+import shutil
+import uuid
+from pathlib import Path
+
+from PIL import Image, ImageOps
+
+
+def media_path(data_dir, reference):
+    if not reference:
+        return None
+    root = Path(data_dir).resolve()
+    candidate = (root / reference).resolve()
+    media_root = root / "media"
+    if not candidate.is_relative_to(media_root) or not candidate.is_file():
+        return None
+    return candidate
+
+
+def persist_media(data_dir, source, image_only=True):
+    if not source:
+        return ""
+    owned = media_path(data_dir, source)
+    if owned:
+        return str(owned.relative_to(Path(data_dir).resolve()))
+    source = Path(source)
+    if not source.is_file():
+        raise ValueError("La imagen o documento ya no está disponible. Volvé a adjuntarlo.")
+    folder = Path(data_dir) / "media"
+    folder.mkdir(parents=True, exist_ok=True)
+    if image_only:
+        with Image.open(source) as im:
+            normalized = ImageOps.exif_transpose(im).convert("RGB")
+            target = folder / f"{uuid.uuid4().hex}.jpg"
+            normalized.save(target, format="JPEG", quality=95)
+    else:
+        target = folder / f"{uuid.uuid4().hex}{source.suffix.lower()}"
+        shutil.copyfile(source, target)
+    return target.relative_to(Path(data_dir)).as_posix()
+
+
+def thumbnail_uri(data_dir, reference):
+    path = media_path(data_dir, reference)
+    if not path:
+        return ""
+    try:
+        with Image.open(path) as im:
+            im.thumbnail((240, 240))
+            out = io.BytesIO()
+            im.convert("RGB").save(out, format="JPEG", quality=80)
+            return "data:image/jpeg;base64," + base64.b64encode(out.getvalue()).decode("ascii")
+    except (OSError, ValueError):
+        return ""
+
+
+def migrate_media(data_dir, state):
+    missing = []
+    def visit(obj):
+        if isinstance(obj, list):
+            for item in obj:
+                visit(item)
+        elif isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in {"photo_path", "original_photo", "original_file", "source_image"} and value:
+                    try:
+                        obj[key] = persist_media(data_dir, value, key != "original_file")
+                    except (OSError, ValueError):
+                        missing.append(str(value))
+                elif isinstance(value, (list, dict)):
+                    visit(value)
+    visit(state)
+    state.setdefault("migration_warnings", []).extend(f"Archivo anterior no recuperable: {x}" for x in missing)
+    return state
+
+
+"""Validated stock, formula and kiln operations on a transaction snapshot."""
+
+
+import copy
+import math
+import uuid
+from datetime import datetime, timezone
+
+
+def timestamp():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def number(value, label, minimum=0):
+    if value is None:
+        raise ValueError(f"Falta {label}.")
+    value = float(value)
+    if not math.isfinite(value) or value < minimum:
+        raise ValueError(f"{label}: ingresá un número válido, mayor o igual a {minimum}.")
+    return value
+
+
+def stock_move(state, material_id, delta, kind, reference, *, reason, reverses=None):
+    if material_id not in state["inventory"]:
+        raise ValueError("Material no encontrado.")
+    delta = float(delta)
+    if not math.isfinite(delta):
+        raise ValueError("Cantidad inválida.")
+    old = number(state["inventory"][material_id]["qty"], "stock")
+    balance = old + delta
+    if balance < -1e-8:
+        raise ValueError("El movimiento dejaría stock negativo. Revisá los consumos relacionados.")
+    if abs(delta) < 1e-8:
+        return None
+    if not str(reason).strip():
+        raise ValueError("Indicá el motivo del movimiento.")
+    movement = {"id": "MOV-" + uuid.uuid4().hex, "at": timestamp(), "material_id": material_id,
+                "delta": delta, "before": old, "after": max(0, balance), "type": kind,
+                "reference_id": reference, "reason": reason, "reverses": reverses}
+    state.setdefault("stock_movements", []).append(movement)
+    state["inventory"][material_id]["qty"] = max(0, balance)
+    return movement
+
+
+def reverse_stock_move(state, movement_id, reason):
+    movement = next((m for m in state["stock_movements"] if m.get("id") == movement_id), None)
+    if not movement or movement.get("reverses"):
+        raise ValueError("Seleccioná un movimiento original válido.")
+    if movement.get("type") == "purchase_receipt":
+        raise ValueError("Corregí la cantidad recibida desde el pedido para mantener pedido y stock vinculados.")
+    if any(m.get("reverses") == movement_id for m in state["stock_movements"]):
+        raise ValueError("Este movimiento ya fue revertido.")
+    return stock_move(state, movement["material_id"], -movement["delta"], "reversal", movement.get("reference_id"), reason=reason, reverses=movement_id)
+
+
+def confirm_consumption(state, material_id, quantity, reference, *, estimated=False, accept_estimate=False, confirmation_id=None):
+    if not reference:
+        raise ValueError("Seleccioná el ensayo, pieza o lote asociado.")
+    records = {**state.get("experiments", {}), **state.get("projects", {}), **state.get("lots", {})}
+    if reference not in records:
+        raise ValueError("El registro asociado no existe.")
+    if estimated and not accept_estimate:
+        raise ValueError("La estimación requiere aceptación explícita antes de descontar stock.")
+    if not confirmation_id:
+        raise ValueError("Falta la identificación de esta confirmación.")
+    if any(m.get("confirmation_id") == confirmation_id for m in state["stock_movements"]):
+        raise ValueError("Este consumo ya fue confirmado.")
+    movement = stock_move(state, material_id, -number(quantity, "consumo"), "consumption", reference, reason="Estimación aceptada" if estimated else "Consumo real confirmado")
+    if movement:
+        movement.update(confirmation_id=confirmation_id, evidence="estimated_accepted" if estimated else "measured")
+    return movement
+
+
+def normalized_components(components):
+    original = copy.deepcopy(components or [])
+    total = sum(number(c.get("amount"), "cantidad") for c in original)
+    if total <= 0:
+        raise ValueError("La fórmula debe tener una cantidad total mayor que cero.")
+    units = {c.get("unit", "g") for c in original}
+    if len(units) > 1:
+        raise ValueError("Unificá las unidades antes de normalizar; no se mezclan gramos y porcentajes.")
+    return [{**c, "amount": c["amount"] / total * 100, "unit": "%"} for c in original]
+
+
+def formula_version(state, source_id, components=None, reason="Modificación"):
+    source = state["formulas"][source_id]
+    derived = copy.deepcopy(source)
+    fid = "FOR-" + uuid.uuid4().hex
+    derived.update(id=fid, derived_from=source_id, root_formula_id=source.get("root_formula_id", source_id),
+                   version=int(source.get("version", 1)) + 1, version_reason=reason,
+                   created_at=timestamp(), origin="Derivada", name=(source.get("name") or source_id) + " · versión")
+    if components is not None:
+        derived["components"] = copy.deepcopy(components)
+    state["formulas"][fid] = derived
+    return fid
+
+
+def mass_variations(tile):
+    stages = [("húmeda", "wet_weight"), ("seca", "dry_weight"), ("bizcocho", "bisque_weight"), ("final", "final_weight")]
+    available = [(label, number(tile[key], "peso")) for label, key in stages if tile.get(key) is not None]
+    return [{"from": a, "to": b, "loss_g": x-y, "loss_percent": (x-y)/x*100 if x else None}
+            for (a, x), (b, y) in zip(available, available[1:])]
+
+
+def transition_firing(state, fid, action, temperature=None):
+    f = state["firings"][fid]
+    expected = {"Programa finalizado": "En cocción", "Apertura": "Enfriando", "Descarga": "Abierto", "Completar": "Descargado"}
+    if f.get("status") != expected[action]:
+        raise ValueError(f"Esta acción requiere estado {expected[action]}. Estado actual: {f.get('status')}.")
+    if action == "Programa finalizado":
+        f.update(status="Enfriando", program_finished_at=timestamp())
+    elif action == "Apertura":
+        measured = number(temperature, "lectura actual del controlador")
+        limit = number(state["settings"].get("opening_temp_c", 50), "límite de apertura")
+        if measured > limit:
+            raise ValueError(f"Apertura bloqueada: {measured:g} °C supera {limit:g} °C.")
+        f.setdefault("temp_log", []).append({"at": timestamp(), "temp_c": measured, "stage": "Apertura confirmada"})
+        f.update(status="Abierto", opened_at=timestamp())
+    elif action == "Descarga":
+        f.update(status="Descargado", unloaded_at=timestamp())
+    else:
+        f.update(status="Finalizada", completed_at=timestamp())
+        for tid in f.get("tile_ids", []):
+            tile = state["tiles"].get(tid)
+            if tile:
+                tile["firing_completed"] = min(int(tile.get("firing_required", 1)), int(tile.get("firing_completed", 0)) + 1)
+                tile["stage"] = "Resultado" if tile["firing_completed"] >= tile.get("firing_required", 1) else "Cocción"
+    return f
+
+
+def cooling_history(state, firing):
+    durations = []
+    for old in state["firings"].values():
+        if old.get("kiln_id") != firing.get("kiln_id") or old.get("program_name") != firing.get("program_name"):
+            continue
+        try:
+            hours = (datetime.fromisoformat(old["opened_at"]) - datetime.fromisoformat(old["program_finished_at"])).total_seconds()/3600
+            if hours > 0:
+                durations.append(hours)
+        except (KeyError, ValueError, TypeError):
+            pass
+    return {"samples": len(durations), "min_hours": min(durations), "max_hours": max(durations)} if len(durations) >= 3 else None
+
+
+"""Offline workshop calculations and element reference; no writes to workshop data."""
+
+import html
+import math
+import re
+
+# Rounded central values from CIAAW Abridged Standard Atomic Weights 2024.
+ATOMIC = {'H':1.008,'Li':6.94,'B':10.81,'C':12.011,'O':15.999,'Na':22.990,'Mg':24.305,'Al':26.982,'Si':28.085,'P':30.974,'K':39.098,'Ca':40.078,'Ti':47.867,'Cr':51.996,'Mn':54.938,'Fe':55.845,'Co':58.933,'Ni':58.693,'Cu':63.546,'Zn':65.38,'Sr':87.62,'Zr':91.222,'Sn':118.71,'Ba':137.33,'Pb':207.2}
+OXIDES = 'Li2O Na2O K2O MgO CaO SrO BaO ZnO PbO Al2O3 B2O3 SiO2 TiO2 ZrO2 SnO2 Fe2O3 FeO MnO MnO2 CoO NiO CuO Cr2O3 P2O5'.split()
+FLUXES = set('Li2O Na2O K2O MgO CaO SrO BaO ZnO PbO'.split())
+ELEMENT_SYMBOLS = 'H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr Rf Db Sg Bh Hs Mt Ds Rg Cn Nh Fl Mc Lv Ts Og'.split()
+ELEMENT_NAMES = 'Hidrógeno Helio Litio Berilio Boro Carbono Nitrógeno Oxígeno Flúor Neón Sodio Magnesio Aluminio Silicio Fósforo Azufre Cloro Argón Potasio Calcio Escandio Titanio Vanadio Cromo Manganeso Hierro Cobalto Níquel Cobre Zinc Galio Germanio Arsénico Selenio Bromo Kriptón Rubidio Estroncio Itrio Circonio Niobio Molibdeno Tecnecio Rutenio Rodio Paladio Plata Cadmio Indio Estaño Antimonio Telurio Yodo Xenón Cesio Bario Lantano Cerio Praseodimio Neodimio Prometio Samario Europio Gadolinio Terbio Disprosio Holmio Erbio Tulio Iterbio Lutecio Hafnio Tantalio Wolframio Renio Osmio Iridio Platino Oro Mercurio Talio Plomo Bismuto Polonio Astato Radón Francio Radio Actinio Torio Protactinio Uranio Neptunio Plutonio Americio Curio Berkelio Californio Einstenio Fermio Mendelevio Nobelio Lawrencio Rutherfordio Dubnio Seaborgio Bohrio Hassio Meitnerio Darmstadtio Roentgenio Copernicio Nihonio Flerovio Moscovio Livermorio Teneso Oganesón'.split()
+ELEMENT_NOTES = {
+    'Si': 'SiO₂ es un formador de red del vidrio; el cuarzo es una materia prima habitual.',
+    'Al': 'Al₂O₃ interviene en la estructura y viscosidad del esmalte; lo aportan, entre otros, arcillas y feldespatos.',
+    'B': 'B₂O₃ participa en vidrios y esmaltes borácicos. Su papel no equivale al de un fundente RO en la normalización Seger.',
+}
+
+
+def positive(value, label, zero=False):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f'Completá {label}.')
+    if not math.isfinite(v) or v < 0 or (not zero and v == 0):
+        raise ValueError(f'{label}: debe ser un número {"no negativo" if zero else "mayor que cero"}.')
+    return v
+
+
+def molecular_mass(formula):
+    parts = re.findall(r'([A-Z][a-z]?)(\d*)', formula)
+    if ''.join(a+n for a,n in parts) != formula or not parts:
+        raise ValueError('Fórmula química no admitida.')
+    try:
+        return sum(ATOMIC[a] * int(n or 1) for a,n in parts)
+    except KeyError:
+        raise ValueError('Masa atómica no cargada para este elemento.')
+
+
+def named_amounts(text):
+    rows = []
+    for i, line in enumerate((text or '').splitlines(), 1):
+        if not line.strip():
+            continue
+        match = re.fullmatch(r'\s*(.+?)\s+([+-]?\d+(?:[.,]\d+)?)\s*', line)
+        if not match:
+            raise ValueError(f'Línea {i}: usá nombre y cantidad; por ejemplo Sílice 30.')
+        rows.append((match[1].strip(), positive(match[2].replace(',', '.'), f'cantidad en línea {i}', zero=True)))
+    if not rows or sum(v for _,v in rows) <= 0:
+        raise ValueError('Ingresá una composición con total mayor que cero.')
+    return rows
+
+
+def table_result(headers, rows, note=''):
+    head = ''.join(f'<th>{html.escape(str(x))}</th>' for x in headers)
+    body = ''.join('<tr>'+''.join(f'<td>{html.escape(str(v))}</td>' for v in row)+'</tr>' for row in rows)
+    return f'<div class="panel"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table><p>{html.escape(note)}</p></div>'
+
+
+def scale_recipe(text, target):
+    rows = named_amounts(text)
+    target = positive(target, 'peso final')
+    total = sum(v for _,v in rows)
+    return table_result(['Material', 'Original (partes)', 'A pesar (g)'], [(name, f'{v:g}', f'{v/total*target:.3f}') for name,v in rows], f'Total: {target:g} g. No modifica la fórmula ni descuenta stock. Usá cantidades de una misma base; no mezcles gramos y porcentajes.')
+
+
+def umf_calculation(text):
+    weights = {}
+    for name, v in named_amounts(text):
+        name = name.translate(str.maketrans('₀₁₂₃₄₅₆₇₈₉', '0123456789'))
+        if name not in OXIDES:
+            raise ValueError(f'Óxido no admitido: {name}. Ingresá análisis de óxidos, no nombres de materias primas.')
+        weights[name] = weights.get(name, 0) + v
+    moles = {name: grams/molecular_mass(name) for name,grams in weights.items()}
+    flux = sum(v for name,v in moles.items() if name in FLUXES)
+    if flux <= 0:
+        raise ValueError('Falta al menos un fundente de la base RO/R₂O para normalizar a unidad.')
+    return table_result(['Óxido','Gramos / partes','Moles','UMF','Grupo'], [(name, f'{weights[name]:g}', f'{v:.5f}', f'{v/flux:.5f}', 'RO / R₂O' if name in FLUXES else 'Fuera de la base') for name,v in moles.items()], 'Base unitaria: Li₂O, Na₂O, K₂O, MgO, CaO, SrO, BaO, ZnO y PbO. B₂O₃ y colorantes se muestran fuera de esa base. Convención declarada, no predicción de maduración, color ni seguridad. No altera los datos originales.')
+
+
+def shrinkage(initial, final):
+    a, b = positive(initial, 'medida inicial'), positive(final, 'medida final', zero=True)
+    return (a-b)/a*100
+
+
+def absorption(dry, saturated):
+    a, b = positive(dry, 'peso seco'), positive(saturated, 'peso saturado')
+    if b < a:
+        raise ValueError('El peso saturado no puede ser menor que el seco. Revisá las mediciones.')
+    return (b-a)/a*100
+
+
+def plaster_batch(plaster, ratio):
+    plaster, ratio = positive(plaster, 'peso de yeso'), positive(ratio, 'agua por 100 de yeso')
+    water = plaster*ratio/100
+    return table_result(['Yeso (g)','Agua (g)','Mezcla (g)'], [(f'{plaster:g}', f'{water:g}', f'{plaster+water:g}')], 'Relación por peso del producto elegido. No calcula volumen de molde ni reemplaza la ficha de su fabricante.')
+
+
+def periodic_html(query=''):
+    query = (query or '').casefold().strip()
+    cells = []
+    for z, (symbol, name) in sorted(enumerate(zip(ELEMENT_SYMBOLS, ELEMENT_NAMES), 1), key=lambda item: (0 if query and query in (str(item[0]),item[1][0].casefold()) else 1, item[0])):
+        if query and query not in f'{z} {symbol} {name}'.casefold():
+            continue
+        related = [o for o in OXIDES if symbol in [a for a,_ in re.findall(r'([A-Z][a-z]?)(\d*)', o)] and symbol != 'O']
+        refs = ' · '.join(f'<a href="https://digitalfire.com/oxide/{o.lower()}" target="_blank" rel="noopener">{o}</a>' for o in related)
+        mass = f'Masa atómica de cálculo ≈ {ATOMIC[symbol]:g} (valor redondeado).' if symbol in ATOMIC else 'Masa atómica: consultar la referencia CIAAW.'
+        note = ELEMENT_NOTES.get(symbol, 'Consultá las referencias de sus compuestos; el elemento puro y sus óxidos no tienen las mismas propiedades.')
+        cells.append(f'<details class="element-card"><summary><small>{z}</small> <b>{symbol}</b><br>{name}</summary><p>{mass}</p><p>{note}</p><p>{refs or "Ficha cerámica específica pendiente."}</p></details>')
+    return '<p>Tocá un elemento para desplegar su ficha. Listado de los 118 elementos por número atómico; buscá por nombre, símbolo o número.</p><div class="element-grid">'+''.join(cells)+'</div><p>Referencias: <a href="https://iupac.org/iptei/" target="_blank" rel="noopener">IUPAC</a> · <a href="https://ciaaw.org/abridged-atomic-weights.htm" target="_blank" rel="noopener">CIAAW: pesos atómicos abreviados</a>. Las fichas ampliadas se incorporan progresivamente.</p>'
+
+
+
 # ============================================================================
 # ALUMINA STUDIO V17 · DIAGRAMACIÓN
 # Consolidación funcional para Google Colab / Gradio 6.5.1
@@ -38,13 +718,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import gradio as gr
-from .storage import Repository, Snapshot, ConflictError, EntityState
-from .workbench import (OXIDES, molecular_mass, scale_recipe, umf_calculation,
-                        shrinkage, absorption, plaster_batch, periodic_html, positive)
-from .media import persist_media, thumbnail_uri, migrate_media, media_path
-from .operations import (stock_move, reverse_stock_move, confirm_consumption,
-                         normalized_components, formula_version, mass_variations,
-                         transition_firing, cooling_history, number)
 
 APP_VERSION = "17.4 REVISION FUNCIONAL · PREVIEW"
 SCHEMA_VERSION = 2

@@ -99,7 +99,7 @@ def plaster_batch(plaster, ratio):
 def periodic_html(query=''):
     query = (query or '').casefold().strip()
     cells = []
-    for z, (symbol, name) in enumerate(zip(ELEMENT_SYMBOLS, ELEMENT_NAMES), 1):
+    for z, (symbol, name) in sorted(enumerate(zip(ELEMENT_SYMBOLS, ELEMENT_NAMES), 1), key=lambda item: (0 if query and query in (str(item[0]),item[1][0].casefold()) else 1, item[0])):
         if query and query not in f'{z} {symbol} {name}'.casefold():
             continue
         related = [o for o in OXIDES if symbol in [a for a,_ in re.findall(r'([A-Z][a-z]?)(\d*)', o)] and symbol != 'O']

@@ -150,6 +150,9 @@ def test_consumption_updates_editable_stock_before_later_save(workshop):
 
 
 def test_indirect_tile_change_requires_reloading_editor(workshop):
+    prepared = studio.load_state()
+    prepared["tiles"]["TES-0001"]["firing_completed"] = prepared["tiles"]["TES-0001"]["firing_required"]
+    studio.save_state(prepared)
     app = studio.build_app()
     token = studio.session_token(studio.load_state())
     result = callback(app,'save_result_cb').fn(token,'TES-0001','#ffffff',None,'Funcionó','Me gusta','Conservar','Comentario','')
