@@ -4,6 +4,8 @@
 
 Ver [correcciones y límites V17.4](docs/REVISION_V17_4.md).
 
+La demo incluye **256 colores digitales sRGB** en SQLite: 240 variantes cromáticas y 16 neutros. En **LAB → Color Sampler → Paleta DEMO**, buscar por nombre, número o HEX y elegir un color actualiza el objetivo. Son referencias digitales, no recetas ni resultados de cocción. Al abrir una base DEMO existente se agregan sólo los registros faltantes, sin reemplazar fórmulas, stock ni colores existentes. La paleta se incluye en las copias de seguridad.
+
 El refresco universal se reemplazó por salidas específicas de cada acción. Los callbacks leen entidades bajo demanda y confirman las escrituras en SQLite antes de responder. La búsqueda usa FTS5 y filtros SQL; las coincidencias de color usan CIEDE2000. Ver [alcance y validación V17.3](docs/RESPUESTA_V17_3.md).
 
 Base recuperada de V16 DEMO FIX3, con navegación **LAB / TALLER / SABER** y una primera migración operativa a SQLite. Esta entrega prioriza persistencia, conflictos entre sesiones, fotos durables, movimientos de stock y etapas de horno antes de ampliar la interfaz.

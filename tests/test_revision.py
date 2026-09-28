@@ -62,3 +62,38 @@ def test_empty_analysis_not_zero_and_periodic_exact_first(app):
     assert 'Sin datos' in html and '0.00%' not in html
     html=periodic_html('Co')
     assert html.index('Cobalto') < html.index('Cobre')
+
+
+def test_demo_palette_is_unique_and_selectable(app):
+    palette = studio.load_state()['color_palette']
+    assert len(palette) == 256
+    assert len({c['hex'] for c in palette.values()}) == 256
+    assert {'#000000', '#FFFFFF'} <= {c['hex'] for c in palette.values()}
+    for color in palette.values():
+        assert color['lab'] == list(studio.hex_to_lab(color['hex']))
+    assert callback(app, 'choose_palette_color').fn('DEMO-COLOR-256') == ('#FFFFFF', 'Digital · Selector')
+
+
+def test_palette_upgrade_preserves_existing_data_and_is_idempotent(app):
+    st = studio.load_state()
+    with studio.repository().transaction(st.revisions) as tx:
+        del tx['state']['color_palette']
+    studio.ensure_demo_palette()
+    st = studio.load_state()
+    st['color_palette']['DEMO-COLOR-001']['name'] = 'Mi referencia'
+    studio.save_state(st)
+    before = studio.load_state()
+    studio.ensure_demo_palette()
+    after = studio.load_state()
+    assert before == after
+    assert before.revisions == after.revisions
+    assert len(after['color_palette']) == 256
+
+
+def test_non_demo_does_not_receive_demo_palette(app):
+    st = studio.load_state()
+    st['settings']['demo_mode'] = False
+    del st['color_palette']
+    studio.save_state(st)
+    studio.ensure_demo_palette()
+    assert not studio.load_state().get('color_palette')

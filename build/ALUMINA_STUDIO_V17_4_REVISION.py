@@ -701,6 +701,7 @@ def periodic_html(query=''):
 # ============================================================================
 
 import copy
+import colorsys
 import html
 import json
 import math
@@ -956,9 +957,54 @@ def initial_state() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def demo_color_palette():
+    """256 referencias sRGB propias, sin atribuirles recetas ni cocción."""
+    families = ["Rojo", "Coral", "Naranja", "Ámbar", "Amarillo", "Lima",
+                "Verde", "Esmeralda", "Turquesa", "Cian", "Azul", "Índigo",
+                "Violeta", "Púrpura", "Magenta", "Rosa"]
+    records = {}
+    def add(name, rgb):
+        ident = f"DEMO-COLOR-{len(records) + 1:03d}"
+        hv = "#" + "".join(f"{round(channel * 255):02X}" for channel in rgb)
+        records[ident] = {"id": ident, "name": name, "hex": hv,
+                          "lab": list(hex_to_lab(hv)), "source": "ALUMINA DEMO",
+                          "kind": "Referencia digital sRGB", "palette_version": 1}
+    for index, family in enumerate(families):
+        for tone, saturation in [("suave", .25), ("medio", .6), ("intenso", .95)]:
+            for level, value in enumerate([.3, .475, .65, .825, 1.0], 1):
+                add(f"{family} {tone} {level}", colorsys.hsv_to_rgb(index / 16, saturation, value))
+    for index in range(16):
+        add("Negro" if index == 0 else "Blanco" if index == 15 else f"Gris {index:02d}", (index / 15,) * 3)
+    return records
+
+
+def ensure_demo_palette():
+    """Backfill only absent demo entries in one transaction, never replace user data."""
+    with repository().transaction({}) as tx:
+        st = tx["state"]
+        if not st.get("settings", {}).get("demo_mode", False):
+            return
+        if "color_palette" not in st:
+            st["color_palette"] = {}
+        palette = st["color_palette"]
+        for ident, record in demo_color_palette().items():
+            if ident not in palette:
+                palette[ident] = record
+
+
+def color_palette_html(palette):
+    cards = "".join(
+        f"<div title='{esc(c['name'])} · {esc(c['hex'])}'><div style='height:30px;"
+        f"background:{esc(normalize_hex(c['hex']))};border:1px solid #ddd;border-radius:5px'></div>"
+        f"<small>{esc(c['id'].rsplit('-', 1)[-1])} · {esc(c['hex'])}</small></div>"
+        for c in palette.values())
+    return f"<div style='display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px'>{cards}</div>"
+
+
 def demo_state() -> Dict[str, Any]:
     """Estado deliberadamente variado para probar flujos, navegación y persistencia."""
     st = initial_state()
+    st["color_palette"] = demo_color_palette()
     st["settings"].update({
         "default_supplier_id": "SUP-0001",
         "default_kiln_id": "KILN-0001",
@@ -2165,6 +2211,9 @@ def saber_text(section):
 
 def build_app() -> gr.Blocks:
     initial = load_state()
+    ensure_demo_palette()
+    initial = load_state()
+    palette0 = initial.get("color_palette", {})
     fchoices0 = [(f"{fid} · {f.get('name') or 'Sin nombre'}", fid) for fid, f in initial["formulas"].items()]
     mchoices0 = [(f"{mid} · {m.get('name')}", mid) for mid, m in initial["inventory"].items()]
     pchoices0 = [(p.get("name", pid), pid) for pid, p in initial["projects"].items()]
@@ -2322,6 +2371,12 @@ def build_app() -> gr.Blocks:
                             target_hex = gr.ColorPicker(value="#F25A18", label="Color objetivo")
                             target_identity = gr.HTML(color_identity_html("#F25A18"))
                             digital_origin = gr.Radio(["Digital · Cámara", "Digital · Selector"], value="Digital · Selector", label="Origen", interactive=True)
+                    with gr.Accordion(f"Paleta DEMO · {len(palette0)} colores", open=False, visible=bool(palette0)):
+                        gr.Markdown("Referencias digitales sRGB: no son recetas ni colores cerámicos garantizados. Elegí un color por nombre, número o HEX para usarlo como objetivo.")
+                        palette_choice = gr.Dropdown(
+                            choices=[(f"{c['id']} · {c['name']} · {c['hex']}", ident) for ident, c in palette0.items()],
+                            value=None, label="Elegir color de la paleta", interactive=True)
+                        gr.HTML(color_palette_html(palette0))
                     formula_name = gr.Textbox(label="Nombre de fórmula (opcional)", placeholder="Ej. Naranja Talavera 01")
                     with gr.Row():
                         f_vehicle = gr.Dropdown(["Esmalte", "Engobe", "Pasta coloreada"], value="Esmalte", label="Vehículo", interactive=True)
@@ -2816,6 +2871,12 @@ def build_app() -> gr.Blocks:
             choices = [a for a,_ in cands]
             return color_identity_html(hv), html_c, gr.update(choices=choices, value=(choices[0] if choices else None)), gr.update(visible=(choices and choices[0]=="Cd-S-Se inclusión"))
         target_hex.change(color_changed, target_hex, [target_identity, pigment_out, pigment_sel, xse])
+
+        def choose_palette_color(ident):
+            if ident not in palette0:
+                return gr.skip(), gr.skip()
+            return palette0[ident]["hex"], "Digital · Selector"
+        palette_choice.change(choose_palette_color, palette_choice, [target_hex, digital_origin])
 
         def pigment_selected(name, x):
             if name == "Cd-S-Se inclusión":
