@@ -14,12 +14,20 @@ Ver [garantías y límites](docs/MOTOR_V17_1.md) y [diagramación](docs/DIAGRAMA
 
 ## Ejecutar
 
+En Mac, doble clic en **Iniciar ALUMINA.command** y abrir **http://127.0.0.1:7861**.
+Mantener la ventana abierta; Ctrl+C detiene el servidor. No necesita Colab ni un enlace Gradio público.
+El primer arranque requiere Python 3.11 o superior y acceso a Internet para instalar dependencias si no existe un entorno virtual.
+
+**Actualizar ALUMINA.command** descarga cambios de la rama actual de GitHub sin sobrescribir modificaciones locales. Reiniciar la aplicación después de actualizar. Los cambios de código hechos localmente se publican mediante commit/push o la conexión de GitHub; no se suben automáticamente al guardar un archivo.
+
+SQLite, fotos y copias de seguridad quedan en `alumina_data/`, excluida de GitHub. Esa carpeta se conserva entre reinicios. Los datos de Colab no se transfieren solos: exportar su ZIP e importarlo desde Parámetros si se quieren conservar. GitHub sincroniza el código, no los datos del taller.
+
 ```bash
 pip install -r requirements.txt
 python run.py
 ```
 
-La carpeta predeterminada es `./alumina_data`. Se puede configurar `ALUMINA_DATA_DIR` antes de ejecutar la app. Sin datos se crea un taller de demostración.
+Con `run.py`, la carpeta predeterminada es `alumina_data` dentro del proyecto, independientemente de dónde se invoque. Se puede configurar `ALUMINA_DATA_DIR` antes de ejecutar la app. Sin datos se crea un taller de demostración. El servidor escucha sólo en este equipo; `python run.py --port 7862` permite elegir otro puerto.
 
 ## Archivo único para Colab
 
